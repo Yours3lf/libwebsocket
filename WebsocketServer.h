@@ -92,8 +92,7 @@ class websocketServer
 			BIO_get_mem_ptr(b64, &bptr);
 
 			hashStrBuf.resize(bptr->length);
-			memcpy(hashStrBuf.data(), bptr->data, bptr->length-1);
-			hashStrBuf[bptr->length-1] = 0;
+			memcpy(hashStrBuf.data(), bptr->data, bptr->length);
 
 			BIO_free_all(b64);
 		}
@@ -135,6 +134,8 @@ class websocketServer
 			"Connection : Upgrade\r\n"
 			"Sec-WebSocket-Accept : " + getHandshakeResponseKey(webSocketKey)
 			+ "\r\n"; //to close the response header
+
+		//std::cout << websocketHandshakeResponse << std::endl;
 
 		c.s.send(websocketHandshakeResponse.data(), websocketHandshakeResponse.length());
 
