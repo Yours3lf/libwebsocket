@@ -1,0 +1,3 @@
+[submodule "libsocket"]
+	path = libsocket
+	url = https://github.com/Yours3lf/libsocket
