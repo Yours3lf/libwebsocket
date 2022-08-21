@@ -13,6 +13,10 @@
 
 #pragma comment(lib, "Crypt32")
 #else
+#include <openssl/sha.h>
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+#include <openssl/buffer.h>
 #endif
 
 
@@ -71,6 +75,29 @@ class websocketServer
 
 		return std::string(hashStrBuf.data());
 #else
+		char* hashPtr = (char*)SHA1((const unsigned char*)webSocketKey.data(), webSocketKey.length(), 0);
+		std::vector<char> hashBuf(20);
+		memcpy(hashBuf.data(), hashPtr, 20);
+
+		std::vector<char> hashStrBuf;
+		{
+			BIO *bmem, *b64;
+			BUF_MEM *bptr;
+
+			b64 = BIO_new(BIO_f_base64());
+			bmem = BIO_new(BIO_s_mem());
+			b64 = BIO_push(b64, bmem);
+			BIO_write(b64, hashBuf.data(), hashBuf.size());
+			BIO_flush(b64);
+			BIO_get_mem_ptr(b64, &bptr);
+
+			hashStrBuf.resize(bptr->length);
+			memcpy(hashStrBuf.data(), bptr->data, bptr->length-1);
+			hashStrBuf[bptr->length-1] = 0;
+
+			BIO_free_all(b64);
+		}
+		return std::string(hashStrBuf.data());
 #endif
 	}
 
