@@ -7,6 +7,7 @@
 #include <thread>
 #include <queue>
 #include <mutex>
+#include <chrono>
 
 class websocketConnection
 {
@@ -383,7 +384,7 @@ public:
 					else
 					{
 						//sleep for 10ms if there are no messages to send
-						Sleep(10);
+						std::this_thread::sleep_for(std::chrono::milliseconds(10));
 					}
 				}
 			});
