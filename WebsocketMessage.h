@@ -2,7 +2,7 @@
 
 #include <vector>
 
-enum frameType
+enum frameType : uint8_t
 {
 	FRAME_CONTINUATION = 0x0,
 	FRAME_TEXT = 0x1,
