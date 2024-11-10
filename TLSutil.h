@@ -144,7 +144,7 @@ class TLSsession
     static SSL_CTX* ctx;
     static bool inited;
 public:
-    static void init()
+    static void init(const std::string& certificate, const std::string& privateKey)
     {
         if (!inited && !ctx)
         {
@@ -165,9 +165,6 @@ public:
             SSL_CTX_set_mode(ctx, SSL_MODE_AUTO_RETRY);
             SSL_CTX_set1_groups_list(ctx, "X25519");
             SSL_CTX_set_cipher_list(ctx, "TLS_AES_128_GCM_SHA256");
-
-            std::string certificate = "/home/yours3lf/.local/share/mkcert/192.168.1.55.pem";
-            std::string privateKey = "/home/yours3lf/.local/share/mkcert/192.168.1.55-key.pem";
 
             if (FILE* file = fopen(certificate.c_str(), "r"))
             {
