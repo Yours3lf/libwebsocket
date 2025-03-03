@@ -43,6 +43,10 @@ class websocketServer
 
 	static void listenToConnections(websocketServer* thisPtr, const std::string& address, int port)
 	{
+#ifndef _WIN32
+        pthread_setname_np(pthread_self(), "Listening thread");
+#endif
+
         std::cout << "Listening thread started: " << std::hex << std::this_thread::get_id() << std::dec << std::endl;
 
         std::cout << "Secure mode: " << (thisPtr->useTLS ? "ON" : "OFF") << std::endl;
@@ -105,12 +109,19 @@ class websocketServer
 
     static void handleMessaging(websocketServer* thisPtr)
     {
+#ifndef _WIN32
+        pthread_setname_np(pthread_self(), "Messaging thread");
+#endif
+
         std::cout << "Messaging thread started: " << std::hex << std::this_thread::get_id() << std::dec << std::endl;
 
         assert(thisPtr);
 
         std::thread receiveThread([&]()
             {
+#ifndef _WIN32
+                pthread_setname_np(pthread_self(), "Receive thread");
+#endif
                 std::cout << "Receive thread started: " << std::hex << std::this_thread::get_id() << std::dec << std::endl;
 
                 while (thisPtr->running)
@@ -179,6 +190,9 @@ class websocketServer
 
         std::thread sendThread([&]()
             {
+#ifndef _WIN32
+                pthread_setname_np(pthread_self(), "Send thread");
+#endif
                 std::cout << "Send thread started: " << std::hex << std::this_thread::get_id() << std::dec << std::endl;
 
                 while (thisPtr->running)
@@ -310,6 +324,8 @@ public:
 
     void closeConnection(uint32_t c)
     {
+        std::cout << "WebsocketServer close" << std::endl;
+
         std::lock_guard<std::mutex> guard(connectionsMutex);
         auto it = connections.find(c);
         if(it != connections.end())

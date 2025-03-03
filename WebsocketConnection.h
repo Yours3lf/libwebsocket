@@ -53,7 +53,7 @@ static std::string getHandshakeResponseKey(const std::string& webSocketKey)
     CryptReleaseContext(cryptoProvider, 0);
     CryptDestroyHash(hashProvider);
 
-    return std::string(hashStrBuf.data());
+    return std::string(hashStrBuf.begin(), hashStrBuf.end());
 #else
     char* hashPtr = (char*)SHA1((const unsigned char*)webSocketKey.data(), webSocketKey.length(), 0);
     std::vector<char> hashBuf(20);
@@ -76,7 +76,7 @@ static std::string getHandshakeResponseKey(const std::string& webSocketKey)
 
         BIO_free_all(b64);
     }
-    return std::string(hashStrBuf.data());
+    return std::string(hashStrBuf.begin(), hashStrBuf.end());
 #endif
 }
 
@@ -612,6 +612,8 @@ public:
 
 	void close(bool useTLS)
 	{
+        std::cout << "WebsocketConnection close" << std::endl;
+
         if (!s.isValid()) return;
 
 		websocketMessage m;
