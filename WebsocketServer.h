@@ -68,12 +68,12 @@ class websocketServer
 		{
 			thisPtr->listeningSocket.listen();
 
-            std::string address;
-            class socket ss = thisPtr->listeningSocket.accept(&address);
+            std::string newAddress;
+            class socket ss = thisPtr->listeningSocket.accept(&newAddress);
 
             if (ss.isValid())
             {
-                std::cout << "Accepted: " << address << std::endl;
+                std::cout << "Accepted: " << newAddress << std::endl;
 
                 websocketConnection c(std::move(ss));
 

@@ -521,9 +521,9 @@ public:
             }
         }
 
-        auto extractString = [](std::vector<std::string>& headerLines, const std::string& key)
+        auto extractString = [](std::vector<std::string>& lines, const std::string& key)
         {
-            for (auto& line : headerLines)
+            for (auto& line : lines)
             {
                 size_t pos = line.find(key);
                 if (pos != std::string::npos && pos == 0)
