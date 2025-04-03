@@ -552,6 +552,12 @@ public:
             std::cout << "WS version: " << wsVersion << std::endl;
             std::cout << "WS extensions: " << wsExtensions << std::endl;
             std::cout << "WS key: " << webSocketKey << std::endl;
+
+            std::cout << std::endl << "Header lines: " << std::endl;
+            for (auto& line : headerLines)
+            {
+                std::cout << line << std::endl;
+            }
         }        
 
         if (webSocketKey.empty()) 
@@ -572,8 +578,8 @@ public:
         std::string websocketHandshakeResponse =
             "HTTP/1.1 101 Switching Protocols\r\n"
             "Upgrade: websocket\r\n"
-            "Connection : Upgrade\r\n"
-            "Sec-WebSocket-Accept : " + getHandshakeResponseKey(webSocketKey)
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Accept: " + getHandshakeResponseKey(webSocketKey)
             + "\r\n"; //to close the response header
 
         if (debugPrint) {
@@ -610,22 +616,25 @@ public:
         return s.isValid();
     }
 
-	void close(bool useTLS)
+	void close(bool useTLS, bool clean = true)
 	{
         std::cout << "WebsocketConnection close" << std::endl;
 
         if (!s.isValid()) return;
 
-		websocketMessage m;
-		m.type = FRAME_CLOSE;
-		sendWebsocketMessage(m, useTLS);
+        if (clean)
+        {
+            websocketMessage m;
+            m.type = FRAME_CLOSE;
+            sendWebsocketMessage(m, useTLS);
+        }
 
         if (useTLS)
         {
-            tlsSession.close();
+            tlsSession.close(clean);
         }
         
-        s.close();
+        s.close(clean);
 	}	
 };
 

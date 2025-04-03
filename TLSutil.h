@@ -244,11 +244,19 @@ public:
                 {
                     continue; //Try again
                 }
+                else if (errorCode == SSL_ERROR_SYSCALL)
+                {
+                    int err = ERR_get_error();
+
+                    if (!err)
+                    {
+                        // connection was probably just closed abruptly if there's no error
+                        return -3;
+                    }
+                }
 
                 std::cerr << "SSL receive failed " << errorCode << std::endl;
-#ifndef _WIN32
-                std::cerr << std::string(strerror(errno)) << std::endl;
-#endif
+                checkErrorMessage(errorCode);
                 ERR_print_errors_fp(stderr);
                 return -1;
             }
@@ -285,11 +293,19 @@ public:
                 {
                     continue; //Try again
                 }
+                else if (errorCode == SSL_ERROR_SYSCALL)
+                {
+                    int err = ERR_peek_error();
+
+                    if (!err)
+                    {
+                        // connection was probably just closed abruptly if there's no error
+                        return -3;
+                    }
+                }
 
                 std::cerr << "SSL send failed " << errorCode << std::endl;
-#ifndef _WIN32
-                std::cerr << std::string(strerror(errno)) << std::endl;
-#endif
+                checkErrorMessage(errorCode);
                 ERR_print_errors_fp(stderr);
                 return -1;
             }
@@ -342,9 +358,16 @@ public:
         return true;
     }
 
-    void close()
+    void close(bool clean = true)
     {
-        if (ssl) {
+        if (ssl) 
+        {
+            if(!clean)
+            {
+                SSL_free(ssl);
+                return;
+            }
+
             int ret = SSL_shutdown(ssl);
             
             if (ret == 0) 
@@ -359,9 +382,7 @@ public:
             {
                 int errorCode = SSL_get_error(ssl, ret);
                 std::cerr << "SSL shutdown failed " << errorCode << std::endl;
-#ifndef _WIN32
-                std::cerr << std::string(strerror(errno)) << std::endl;
-#endif
+                checkErrorMessage(errorCode);
                 ERR_print_errors_fp(stderr);
             }
         }

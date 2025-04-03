@@ -12,6 +12,8 @@ class websocketServer
 
     std::mutex connectionsMutex;
 	std::unordered_map<uint32_t, websocketConnection> connections;
+    std::mutex connectionsToBeClosedMutex;
+    std::queue<std::pair<uint32_t, bool> > connectionsToBeClosed; // connection id, close clean
 
     std::mutex sendMessageQueueMutex;
     std::queue<std::pair<uint32_t, std::unique_ptr<websocketMessage> > > sendMessageQueue;
@@ -128,6 +130,8 @@ class websocketServer
                 {
                     if (thisPtr->hasConnections())
                     {
+                        thisPtr->cleanUpConnections();
+
                         std::lock_guard<std::mutex> guard(thisPtr->connectionsMutex);
 
                         for (auto& c : thisPtr->connections)
@@ -141,13 +145,17 @@ class websocketServer
                             if (ret < 0)
                             {
                                 //other side closed the connection
-                                if (ret == -2)
+                                if (ret == -2 || ret == -3)
                                 {
                                     std::cerr << "receive connection closed" << std::endl;
 
                                     m->buf.clear();
                                     m->type = FRAME_CLOSE;
                                     thisPtr->pushMessageReceived(std::make_pair(c.first, std::move(m)));
+
+                                    thisPtr->connectionsToBeClosedMutex.lock();
+                                    thisPtr->connectionsToBeClosed.push(std::make_pair(c.first, ret == -2));
+                                    thisPtr->connectionsToBeClosedMutex.unlock();
                                 }
                                 else
                                 {
@@ -203,6 +211,8 @@ class websocketServer
 
                         if (m.second)
                         {
+                            thisPtr->cleanUpConnections();
+
                             std::lock_guard<std::mutex> guard(thisPtr->connectionsMutex);
                             auto it = thisPtr->connections.find(m.first);
                             if (it != thisPtr->connections.end())
@@ -213,13 +223,17 @@ class websocketServer
                                 if (ret < 0)
                                 {
                                     //other side closed the connection
-                                    if (ret == -2)
+                                    if (ret == -2 || ret == -3)
                                     {
                                         std::cerr << "send connection closed" << std::endl;
 
                                         m.second->buf.clear();
                                         m.second->type = FRAME_CLOSE;
                                         thisPtr->pushMessageReceived(std::move(m));
+
+                                        thisPtr->connectionsToBeClosedMutex.lock();
+                                        thisPtr->connectionsToBeClosed.push(std::make_pair(it->first, ret == -2));
+                                        thisPtr->connectionsToBeClosedMutex.unlock();
                                     }
                                     else
                                     {
@@ -256,6 +270,18 @@ class websocketServer
     {
         std::lock_guard<std::mutex> guard(receiveMessageQueueMutex);
         receiveMessageQueue.push(std::move(m));
+    }
+
+    void cleanUpConnections()
+    {
+        std::lock_guard<std::mutex> guard(connectionsToBeClosedMutex);
+
+        while (!this->connectionsToBeClosed.empty())
+        {
+            auto candidate = this->connectionsToBeClosed.front();
+            this->connectionsToBeClosed.pop();
+            this->closeConnection(candidate.first, candidate.second);
+        }
     }
 
 public:
@@ -322,7 +348,7 @@ public:
         }
 	}
 
-    void closeConnection(uint32_t c)
+    void closeConnection(uint32_t c, bool clean = true)
     {
         std::cout << "WebsocketServer close" << std::endl;
 
@@ -330,7 +356,7 @@ public:
         auto it = connections.find(c);
         if(it != connections.end())
         {
-            it->second.close(useTLS);
+            it->second.close(useTLS, clean);
             connections.erase(it);
         }
     }
