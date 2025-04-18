@@ -128,7 +128,7 @@ private:
         }
     }
 
-    int send(char* buf, int len, bool useTLS)
+    int send(const char* buf, int len, bool useTLS)
     {
         if (useTLS)
         {
@@ -588,7 +588,7 @@ public:
 
         std::cout << "Sending websocket handshake response..." << std::endl;
 
-        int ret = send(websocketHandshakeResponse.data(), websocketHandshakeResponse.size(), useTLS);
+        int ret = send((const char*)websocketHandshakeResponse.data(), websocketHandshakeResponse.size(), useTLS);
         if (ret < 0)
         {
             std::cerr << "error while sending websocket handshake response" << std::endl;

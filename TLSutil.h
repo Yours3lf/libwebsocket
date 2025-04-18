@@ -272,7 +272,7 @@ public:
         return bytesReceived;
     }
 
-    int sendMessage(char* buf, int len)
+    int sendMessage(const char* buf, int len)
     {
         if (!inited || !ctx || !ssl) return -1;
 

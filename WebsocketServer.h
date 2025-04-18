@@ -89,7 +89,9 @@ class websocketServer
                     
                     uint32_t id = thisPtr->pickID();
 
-                    if (thisPtr->acceptConnectionCallback && thisPtr->acceptConnectionCallback(id, url, thisPtr->acceptConnectionCallbackDataPtr))
+                    if(!thisPtr->acceptConnectionCallback ||
+                        (thisPtr->acceptConnectionCallback &&
+                        thisPtr->acceptConnectionCallback(id, url, thisPtr->acceptConnectionCallbackDataPtr)))
                     {
                         std::lock_guard<std::mutex> guard(thisPtr->connectionsMutex);
                         thisPtr->connections.emplace(id, std::move(c));
