@@ -108,6 +108,10 @@ class websocketServer
                     c.close(thisPtr->useTLS);
                 }
             }
+            else
+            {
+                std::cerr << "Listener got new connection, but handle is invalid." << std::endl; //
+            }
 		}
 	}
 
