@@ -55,7 +55,7 @@ static std::string getHandshakeResponseKey(const std::string& webSocketKey)
 
     return std::string(hashStrBuf.begin(), hashStrBuf.end());
 #else
-    char* hashPtr = (char*)SHA1((const unsigned char*)webSocketKey.data(), webSocketKey.length(), 0);
+    char* hashPtr = (char*)SHA1((const unsigned char*)webSocketKey.data(), webSocketKey.length(), nullptr);
     std::vector<char> hashBuf(20);
     memcpy(hashBuf.data(), hashPtr, 20);
 
@@ -172,7 +172,7 @@ public:
 
         bool debugPrint = false;
 
-        int startSize = m.buf.size();
+        uint32_t startSize = m.buf.size();
 
         m.type = (frameType)0xff;
 
@@ -337,7 +337,7 @@ public:
                 std::cout << "masking key: " << uint32_t(mask[0]) << " " << uint32_t(mask[1]) << " " << uint32_t(mask[2]) << " " << uint32_t(mask[3]) << std::endl;
             }
 
-            char* encodedData = getRawData<char>(receiveBuf, payloadByteOffset, payloadLen);
+            const char* encodedData = getRawData<char>(receiveBuf, payloadByteOffset, payloadLen);
 
             if (encodedData)
             {

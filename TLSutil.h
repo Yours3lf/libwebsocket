@@ -26,32 +26,32 @@
 static uint16_t swapEndianness(uint16_t x)
 {
     uint16_t converted = 0;
-    converted |= (0x00ff & x) << 8;
-    converted |= (0xff00 & x) >> 8;
+    converted |= (0x00ffu & x) << 8u;
+    converted |= (0xff00u & x) >> 8u;
     return converted;
 }
 
 static uint32_t swapEndianness(uint32_t x)
 {
     uint32_t converted = 0;
-    converted |= (0x000000ff & x) << 24;
-    converted |= (0x0000ff00 & x) << 8;
-    converted |= (0x00ff0000 & x) >> 8;
-    converted |= (0xff000000 & x) >> 24;
+    converted |= (0x000000ffu & x) << 24u;
+    converted |= (0x0000ff00u & x) << 8u;
+    converted |= (0x00ff0000u & x) >> 8u;
+    converted |= (0xff000000u & x) >> 24u;
     return converted;
 }
 
 static uint64_t swapEndianness(uint64_t x)
 {
     uint64_t converted = 0;
-    converted |= (0x00000000000000ffull & x) << 56;
-    converted |= (0x000000000000ff00ull & x) << 40;
-    converted |= (0x0000000000ff0000ull & x) << 24;
-    converted |= (0x00000000ff000000ull & x) << 8;
-    converted |= (0x000000ff00000000ull & x) >> 8;
-    converted |= (0x0000ff0000000000ull & x) >> 24;
-    converted |= (0x00ff000000000000ull & x) >> 40;
-    converted |= (0xff00000000000000ull & x) >> 56;
+    converted |= (0x00000000000000ffull & x) << 56ull;
+    converted |= (0x000000000000ff00ull & x) << 40ull;
+    converted |= (0x0000000000ff0000ull & x) << 24ull;
+    converted |= (0x00000000ff000000ull & x) << 8ull;
+    converted |= (0x000000ff00000000ull & x) >> 8ull;
+    converted |= (0x0000ff0000000000ull & x) >> 24ull;
+    converted |= (0x00ff000000000000ull & x) >> 40ull;
+    converted |= (0xff00000000000000ull & x) >> 56ull;
     return converted;
 }
 
@@ -62,9 +62,9 @@ static uint64_t swapEndianness(uint64_t x)
 static uint32_t extractBitRange(uint32_t data, uint8_t firstBit, uint8_t lastBit)
 {
     assert(lastBit >= firstBit);
-    assert(firstBit >= 0 && firstBit <= 31);
-    assert(lastBit >= 0 && lastBit <= 31);
-    return (data >> firstBit) & ~(~0ull << (lastBit - firstBit + 1));
+    assert(firstBit <= 31);
+    assert(lastBit <= 31);
+    return (data >> firstBit) & ~(~0u << (lastBit - firstBit + 1u));
 }
 
 void printRawData(const char* raw, int len)
@@ -78,7 +78,7 @@ void printRawData(const char* raw, int len)
 
 void printRawData(const std::vector<char>& raw)
 {
-    for (int c = 0; c < raw.size(); ++c)
+    for (uint c = 0; c < raw.size(); ++c)
     {
         printf("%02x ", raw[c]);
     }
@@ -87,7 +87,7 @@ void printRawData(const std::vector<char>& raw)
 
 void printRawData(const std::vector<uint8_t>& raw)
 {
-    for (int c = 0; c < raw.size(); ++c)
+    for (uint c = 0; c < raw.size(); ++c)
     {
         printf("%02x ", raw[c]);
     }
@@ -95,9 +95,9 @@ void printRawData(const std::vector<uint8_t>& raw)
 }
 
 template<typename t>
-static t* getRawData(const std::vector<char>& data, uint32_t& payloadByteOffset, uint32_t length = 0)
+static const t* getRawData(const std::vector<char>& data, uint32_t& payloadByteOffset, uint32_t length = 0)
 {
-    t* d = (t*)(data.data() + payloadByteOffset);
+    const t* d = (const t*)(data.data() + payloadByteOffset);
 
     uint32_t l = 0;
 
@@ -111,7 +111,7 @@ static t* getRawData(const std::vector<char>& data, uint32_t& payloadByteOffset,
     }
 
     //make sure we don't overrun our buffer
-    if (payloadByteOffset + l > data.size()) { return 0;  }
+    if (payloadByteOffset + l > data.size()) { return nullptr;  }
 
     payloadByteOffset += l;
 
@@ -119,7 +119,7 @@ static t* getRawData(const std::vector<char>& data, uint32_t& payloadByteOffset,
 }
 
 template<typename t>
-static void derefRawData(t* raw, t& candidate)
+static void derefRawData(const t* raw, t& candidate)
 {
     assert(raw);
 
@@ -143,7 +143,7 @@ static void setRawData(std::vector<char>& buf, const t* data, uint32_t length = 
 
 class TLSsession
 {
-    SSL* ssl = 0;
+    SSL* ssl = nullptr;
 
     static SSL_CTX* ctx;
     static bool inited;
@@ -246,7 +246,7 @@ public:
                 }
                 else if (errorCode == SSL_ERROR_SYSCALL)
                 {
-                    int err = ERR_get_error();
+                    uint32_t err = ERR_get_error();
 
                     if (!err)
                     {
@@ -295,7 +295,7 @@ public:
                 }
                 else if (errorCode == SSL_ERROR_SYSCALL)
                 {
-                    int err = ERR_peek_error();
+                    uint32_t err = ERR_peek_error();
 
                     if (!err)
                     {
@@ -389,5 +389,5 @@ public:
     }
 };
 
-SSL_CTX* TLSsession::ctx = 0;
+SSL_CTX* TLSsession::ctx = nullptr;
 bool TLSsession::inited = false;

@@ -23,8 +23,8 @@ class websocketServer
 	bool running = true;
     bool useTLS = false;
 
-    bool (*acceptConnectionCallback)(uint32_t, const std::string&, void*) = 0;
-    void* acceptConnectionCallbackDataPtr = 0;
+    bool (*acceptConnectionCallback)(uint32_t, const std::string&, void*) = nullptr;
+    void* acceptConnectionCallbackDataPtr = nullptr;
 
     uint32_t pickID()
     {
@@ -297,7 +297,7 @@ public:
         useTLS = secure;
     }
 
-	void run(const std::string& address, int port, bool (*acceptConnectionCallbackPtr)(uint32_t, const std::string&, void*) = 0, void* callbackDataPtr = 0)
+	void run(const std::string& address, int port, bool (*acceptConnectionCallbackPtr)(uint32_t, const std::string&, void*) = nullptr, void* callbackDataPtr = nullptr)
 	{
         acceptConnectionCallback = acceptConnectionCallbackPtr;
         acceptConnectionCallbackDataPtr = callbackDataPtr;
