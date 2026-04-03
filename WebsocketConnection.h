@@ -4,6 +4,11 @@
 #include "WebsocketMessage.h"
 #include "TLSutil.h"
 
+#ifdef Z_SOLO
+#error "Z_SOLO defined, but we use standard malloc"
+#endif
+#include "zlib/zlib.h"
+
 #include <vector>
 #include <thread>
 #include <queue>
@@ -76,7 +81,7 @@ static std::string getHandshakeResponseKey(const std::string& webSocketKey)
 
         BIO_free_all(b64);
     }
-    return std::string(hashStrBuf.begin(), hashStrBuf.end());
+    return std::string(hashStrBuf.begin(), hashStrBuf.end() - 1);
 #endif
 }
 
@@ -140,6 +145,17 @@ private:
         }
     }
 
+    bool enableDeflate = false;
+    bool compressorStream = true;
+    bool deCompressorStream = true;
+    const int32_t compressorBits = 15;
+    const int32_t deCompressorBits = 15;
+    z_stream* compressor = nullptr;
+    z_stream* deCompressor = nullptr;
+    const int32_t compressionLevel = Z_BEST_COMPRESSION; //max
+    std::vector<char> compressionBuf;
+    std::vector<char> deCompressionBuf;
+
     std::string url;
 
     const static std::string magicString;
@@ -170,11 +186,19 @@ public:
         +---------------------------------------------------------------+
         /**/
 
-        bool debugPrint = false;
+        bool debugPrint = true;
 
         uint32_t startSize = m.buf.size();
 
         m.type = (frameType)0xff;
+
+        bool firstFrame = true;
+        bool isCompressed = false;
+
+        if (debugPrint) 
+        {
+            std::cout << "Receiving websocket message, startsize: " << startSize << std::endl;
+        }
 
         //Websocket frames may come in multiple messages
         //Indicated by the fin bit whether it's the last one or not
@@ -210,12 +234,31 @@ public:
                 std::cout << "masked: " << h.masked << std::endl;
             }
 
-            if (h.rsv1 || h.rsv2 || h.rsv3)
+            if(enableDeflate)
             {
-                std::cerr << "Websocket header rsv1,2,3 must be zero unless an extension is negotiated" << std::endl;
-                std::cerr << h.rsv1 << " " << h.rsv2 << " " << h.rsv3 << std::endl;
-                close(useTLS);
-                return -1;
+                //with deflate rsv1 indicates if the frame is compressed
+                if (h.rsv2 || h.rsv3)
+                {
+                    std::cerr << "Websocket header rsv2,3 must be zero unless an extension is negotiated" << std::endl;
+                    std::cerr << h.rsv2 << " " << h.rsv3 << std::endl;
+                    close(useTLS);
+                    return -1;
+                }
+
+                if(firstFrame && h.rsv1)
+                {
+                    isCompressed = true;
+                }
+            }
+            else
+            {
+                if (h.rsv1 || h.rsv2 || h.rsv3)
+                {
+                    std::cerr << "Websocket header rsv1,2,3 must be zero unless an extension is negotiated" << std::endl;
+                    std::cerr << h.rsv1 << " " << h.rsv2 << " " << h.rsv3 << std::endl;
+                    close(useTLS);
+                    return -1;
+                }
             }
 
             //opcode must be valid
@@ -284,6 +327,10 @@ public:
             //https://datatracker.ietf.org/doc/html/rfc6455#section-5.4
             if(h.opcode == FRAME_CLOSE)
             {
+                if(debugPrint)
+                {
+                    std::cout << "Got websocketMessage with close frame" << std::endl;
+                }
                 close(useTLS);
                 return -2;
             }
@@ -359,6 +406,123 @@ public:
 
                 return -1;
             }
+
+            if(firstFrame)
+            {
+                firstFrame = false;
+            }
+        }
+
+        if(isCompressed && m.buf.size() - startSize > 0)
+        {
+            if(!deCompressor)
+            {
+                std::cerr << "decompressor not inited" << std::endl;
+                return -1;
+            }
+
+            //decompress message
+            bool hasTail = false;
+                //(m.buf.size() - startSize) >= 4 &&
+                //m.buf[m.buf.size() - startSize - 4] == 0x00 &&
+                //m.buf[m.buf.size() - startSize - 3] == 0x00 &&
+                //m.buf[m.buf.size() - startSize - 2] == 0xff &&
+                //m.buf[m.buf.size() - startSize - 1] == 0xff;
+
+            if(debugPrint)
+            {
+                std::cout << "Has tail: " << hasTail << std::endl;
+            }
+
+            if(!hasTail)
+            {
+                std::vector<char> appendix = {0x00, 0x00, 0xff, 0xff};
+                m.buf.insert(std::end(m.buf), appendix.begin(), appendix.end());
+            }
+
+            if(debugPrint)
+            {
+                for(uint32_t c = startSize; c < (m.buf.size() - startSize); ++c)
+                {
+                    printf("0x%02X ", m.buf[c]);
+                    //printf("%c", m.buf[c]);
+                }
+                printf("\n");
+            }
+
+            //reasonable starting decompression buf size
+            deCompressionBuf.resize((m.buf.size() - startSize) * 3 + 1024);
+
+            uint32_t before = deCompressor->total_out;
+
+            deCompressor->next_in = (unsigned char*)m.buf.data() + startSize;
+            deCompressor->avail_in = m.buf.size() - startSize;
+            deCompressor->next_out = (unsigned char*)deCompressionBuf.data();
+            deCompressor->avail_out = deCompressionBuf.size();
+            
+            int res = Z_OK;
+            while(true)
+            {
+                if(debugPrint)
+                {
+                    std::cout << "next out: " << (void*)deCompressor->next_out << std::endl;
+                    std::cout << "avail_out: " << deCompressor->avail_out << std::endl;
+                    std::cout << "next_in: " << (void*)deCompressor->next_in << std::endl;
+                    std::cout << "avail_in: " << deCompressor->avail_in << std::endl;
+                }
+
+                res = inflate(deCompressor, Z_SYNC_FLUSH);
+
+                if(debugPrint)
+                {
+                    std::cout << "Decompression result: " << res << " buf size: " << deCompressionBuf.size() << std::endl;
+                }
+
+                if(res == Z_OK || res == Z_STREAM_END)
+                {
+                    if(deCompressor->avail_in == 0) break;
+                    
+                }
+                else if(res == Z_BUF_ERROR)
+                {
+                    uint32_t oldSize = deCompressionBuf.size();
+                    //double decompression buffer size and try again
+                    deCompressionBuf.resize(deCompressionBuf.size() * 2);
+
+                    deCompressor->next_out = (Bytef*)deCompressionBuf.data() + oldSize;
+                    deCompressor->avail_out = deCompressionBuf.size() - oldSize;
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            if(res == Z_OK)
+            {
+                uint32_t decompressedSize = deCompressor->total_out - before;
+
+                if(debugPrint)
+                {
+                    std::cout << "Decompressed buf: " << decompressedSize << std::endl;
+                    //std::cout << std::string(deCompressionBuf.begin(), deCompressionBuf.end()) << std::endl;
+                }
+
+                //on success copy the decompressed data to the output message
+                m.buf.resize(startSize + decompressedSize);
+                memcpy(m.buf.data() + startSize, deCompressionBuf.data(), decompressedSize);
+
+                if(!deCompressorStream)
+                {
+                    inflateReset(deCompressor);
+                }
+            }
+            else
+            {
+                std::cerr << "Error while running zlib decompression: " << res << std::endl;
+
+                return -1;
+            }
         }
 
         return m.buf.size() - startSize;
@@ -366,6 +530,14 @@ public:
 
     int sendWebsocketMessage(const websocketMessage& m, bool useTLS)
     {
+        bool debugPrint = true;
+
+        if (debugPrint) 
+        {
+            std::cout << "Sending websocket message" << std::endl;
+            //std::cout << std::string(m.buf.begin(), m.buf.end()) << std::endl;
+        }
+
         std::vector<char> outBuf;
 
         websocketHeader h = {};
@@ -373,52 +545,144 @@ public:
         h.masked = false; //server must send unmasked
         h.fin = true; //we'll just send one frame to keep it simple, it can be huge anyways
 
+        const char* buf = m.buf.data();
+        size_t bufSize = m.buf.size();
+
+        if(enableDeflate && buf && bufSize)
+        {
+            compressionBuf.resize(compressBound(m.buf.size()));
+
+            compressor->next_out = (unsigned char*)compressionBuf.data();
+            compressor->avail_out = compressionBuf.size();
+            compressor->next_in = (unsigned char*)m.buf.data();
+            compressor->avail_in = m.buf.size();
+
+            uint32_t before = compressor->total_out;
+
+            if(debugPrint)
+            {
+                std::cout << "compression size before: " << before << std::endl;
+                std::cout << "next out: " << (void*)compressor->next_out << std::endl;
+                std::cout << "avail_out: " << compressor->avail_out << std::endl;
+                std::cout << "next_in: " << (void*)compressor->next_in << std::endl;
+                std::cout << "avail_in: " << compressor->avail_in << std::endl;
+            }
+
+            int res = deflate(compressor, Z_SYNC_FLUSH);
+
+            uint32_t compressedSize = compressor->total_out - before;
+
+            if(res < 0)
+            {
+                std::cerr << "websocket message compression res: " << res << std::endl;
+                return -1;
+            }
+
+            if(debugPrint)
+            {
+                std::cout << "compressed size: " << compressedSize << std::endl;
+            }
+
+            //only compress the frame if we managed to make it smaller than the input data
+            if(compressedSize > 0 && compressedSize < m.buf.size())
+            {
+                if(debugPrint)
+                {
+                    std::cout << "before tail stripping" << std::endl;
+                    for(uint32_t c = 0; c < compressedSize; ++c)
+                    {
+                        printf("0x%02X ", compressionBuf[c]);
+                        //printf("%c", m.buf[c]);
+                    }
+                    printf("\n");
+                }
+
+                //flip rsv1 bit to indicate compressed frame
+                h.rsv1 = 1;
+
+                bool hasTail = true;
+                //compressionBuf.size() >= 4 &&
+                //compressionBuf[compressionBuf.size() - 4] == 0x00 &&
+                //compressionBuf[compressionBuf.size() - 3] == 0x00 &&
+                //compressionBuf[compressionBuf.size() - 2] == 0xff &&
+                //compressionBuf[compressionBuf.size() - 1] == 0xff;
+
+                buf = compressionBuf.data();
+                bufSize = compressedSize - (hasTail ? 4 : 0); //account for flush marker
+
+                if(debugPrint)
+                {
+                    std::cout << "after tail stripping" << std::endl;
+                    for(uint32_t c = 0; c < bufSize; ++c)
+                    {
+                        printf("0x%02X ", buf[c]);
+                        //printf("%c", m.buf[c]);
+                    }
+                    printf("\n");
+                }
+            }
+
+            if(!compressorStream)
+            {
+                deflateReset(compressor);
+            }
+        }
+
         uint16_t maxFourBytesPayloadSize = 0;
         maxFourBytesPayloadSize = ~maxFourBytesPayloadSize;
 
-        if (m.buf.size() < 126)
+        if (bufSize < 126)
         {
-            h.payloadLen = m.buf.size();
+            h.payloadLen = bufSize;
 
-            outBuf.reserve(sizeof(h) + m.buf.size());
+            outBuf.reserve(sizeof(h) + bufSize);
 
             setRawData(outBuf, &h);
-            if (!m.buf.empty())
+            if (buf && bufSize)
             {
-                setRawData(outBuf, m.buf.data(), m.buf.size());
+                setRawData(outBuf, buf, bufSize);
             }
         }
-        else if (m.buf.size() < size_t(maxFourBytesPayloadSize))
+        else if (bufSize < size_t(maxFourBytesPayloadSize))
         {
             h.payloadLen = 126;
-            uint16_t extendedPayloadLen = m.buf.size();
+            uint16_t extendedPayloadLen = bufSize;
             uint16_t extendedPayloadLenBE = swapEndianness(extendedPayloadLen);
 
-            outBuf.reserve(sizeof(h) + sizeof(uint16_t) + m.buf.size());
+            outBuf.reserve(sizeof(h) + sizeof(uint16_t) + bufSize);
 
             setRawData(outBuf, &h);
             setRawData(outBuf, &extendedPayloadLenBE);
-            if (!m.buf.empty())
+            if (buf && bufSize)
             {
-                setRawData(outBuf, m.buf.data(), m.buf.size());
+                setRawData(outBuf, buf, bufSize);
             }
         }
         else
         {
-            assert(m.buf.size() < (~0ull >> 1));
+            assert(bufSize < (~0ull >> 1));
 
             h.payloadLen = 127;
-            uint64_t extendedPayloadLen = m.buf.size();
+            uint64_t extendedPayloadLen = bufSize;
             uint64_t extendedPayloadLenBE = swapEndianness(extendedPayloadLen);
 
-            outBuf.reserve(sizeof(h) + sizeof(uint64_t) + m.buf.size());
+            outBuf.reserve(sizeof(h) + sizeof(uint64_t) + bufSize);
 
             setRawData(outBuf, &h);
             setRawData(outBuf, &extendedPayloadLenBE);
-            if (!m.buf.empty())
+            if (buf && bufSize)
             {
-                setRawData(outBuf, m.buf.data(), m.buf.size());
+                setRawData(outBuf, buf, bufSize);
             }
+        }
+
+        if (debugPrint) 
+        {
+            std::cout << "fin: " << h.fin << std::endl;
+            std::cout << "RSV123: " << h.rsv1 << " " << h.rsv2 << " " << h.rsv3 << std::endl;
+            std::cout << "opcode: " << uint32_t(h.opcode) << std::endl;
+            std::cout << "masked: " << h.masked << std::endl;
+            std::cout << "payload len bytes: " << bufSize << std::endl;
         }
 
         return send(outBuf.data(), outBuf.size(), useTLS);
@@ -472,8 +736,6 @@ public:
 
             std::cout << "We got " << ret << " bytes" << std::endl;
 
-            receiveBuf.resize(ret);
-
             splitHeader(receiveBuf.data(), headerLines);
         }
 
@@ -523,16 +785,17 @@ public:
 
         auto extractString = [](std::vector<std::string>& lines, const std::string& key)
         {
+            std::string result;
             for (auto& line : lines)
             {
                 size_t pos = line.find(key);
                 if (pos != std::string::npos && pos == 0)
                 {
-                    return line.substr(key.length());
+                    result += line.substr(key.length());
                 }
             }
 
-            return std::string();
+            return result;
         };
 
         host = extractString(headerLines, "Host: ");
@@ -558,7 +821,78 @@ public:
             {
                 std::cout << line << std::endl;
             }
-        }        
+        }
+        
+        if(wsExtensions.find("permessage-deflate") != wsExtensions.npos)
+        {
+            enableDeflate = true;
+        }
+
+        if(wsExtensions.find("server_no_context_takeover") != wsExtensions.npos)
+        {
+            compressorStream = false;
+        }
+
+        if(wsExtensions.find("client_no_context_takeover") != wsExtensions.npos)
+        {
+            deCompressorStream = false;
+        }
+
+        auto getVal = [](const std::string& str, const std::string& tofind) -> std::string
+        {
+            //find token we're looking for
+            auto it = str.find(tofind);
+            if(it == str.npos) return "";
+
+            //clip it off so we can only have
+            // "" -> end of header line
+            // "; rest of the header line"
+            // "=[val]; rest of header line"
+            std::string sub = str.substr(it + tofind.length());
+
+            auto valIt = sub.find(";");
+
+            //if we have a semicolon, we might have a value
+            if(valIt != sub.npos)
+            {
+                //in case we only have the semicolon, don't get the whole string
+                return sub.substr(1, valIt > 0 ? valIt - 1 : 0);
+            }
+
+            return "";
+        };
+
+        bool includeServerBitsInResponse = false;
+        if(wsExtensions.find("server_max_window_bits") != wsExtensions.npos)
+        {
+            includeServerBitsInResponse = true;
+
+            auto valueStr = getVal(wsExtensions, "server_max_window_bits");
+
+            if(!valueStr.empty())
+            {
+                uint32_t bits = std::stoi(valueStr);
+
+                //libdeflate has a hardcoded 32KB sliding window so bits must be 15
+                if(bits < 15) return false;
+            }
+        }
+
+        bool includeClientBitsInResponse = false;
+        if(wsExtensions.find("client_max_window_bits") != wsExtensions.npos)
+        {
+            includeClientBitsInResponse = true;
+
+            auto valueStr = getVal(wsExtensions, "client_max_window_bits");
+
+            if(!valueStr.empty())
+            {
+                uint32_t bits = std::stoi(valueStr);
+
+                //libdeflate has a hardcoded 32KB sliding window so bits must be 15
+                if(bits < 15) return false;
+            }
+        }
 
         if (webSocketKey.empty()) 
         {
@@ -575,12 +909,48 @@ public:
         //prepare websocket handshake response
         webSocketKey += magicString;
 
+        std::string responseKey = getHandshakeResponseKey(webSocketKey);
+
+        if(debugPrint)
+        {
+            std::cout << responseKey << std::endl;
+        }
+
         std::string websocketHandshakeResponse =
             "HTTP/1.1 101 Switching Protocols\r\n"
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
-            "Sec-WebSocket-Accept: " + getHandshakeResponseKey(webSocketKey)
-            + "\r\n"; //to close the response header
+            "Sec-WebSocket-Accept: " + responseKey + "\r\n";
+
+        if(enableDeflate)
+        {
+            websocketHandshakeResponse += "Sec-WebSocket-Extensions: permessage-deflate";
+            
+            if(includeClientBitsInResponse)
+            {
+                websocketHandshakeResponse += "; client_max_window_bits=" + std::to_string(deCompressorBits);
+            }
+
+            if(includeClientBitsInResponse)
+            {
+                websocketHandshakeResponse += "; server_max_window_bits=" + std::to_string(compressorBits);
+            }
+
+            if(!deCompressorStream)
+            {
+                websocketHandshakeResponse += "; client_no_context_takeover";
+            }
+
+            if(!compressorStream)
+            {
+                websocketHandshakeResponse += "; server_no_context_takeover";
+            }
+
+            websocketHandshakeResponse += "\r\n";
+        }
+
+        //must have a close
+        websocketHandshakeResponse += "\r\n";
 
         if (debugPrint) {
             std::cout << websocketHandshakeResponse << std::endl;
@@ -593,6 +963,32 @@ public:
         {
             std::cerr << "error while sending websocket handshake response" << std::endl;
             return false;
+        }
+
+        if(enableDeflate)
+        {
+            compressor = (z_stream*)malloc(sizeof(z_stream));
+            deCompressor = (z_stream*)malloc(sizeof(z_stream));
+            memset(compressor, 0, sizeof(z_stream));
+            memset(deCompressor, 0, sizeof(z_stream));
+
+            //could use _ex version if custom malloc/free is used
+            int res = 0;
+            res = deflateInit2(compressor, compressionLevel, Z_DEFLATED, -compressorBits, MAX_MEM_LEVEL, Z_DEFAULT_STRATEGY);
+
+            if(res != Z_OK)
+            {
+                std::cerr << "error while initing zlib compressor: " << res << std::endl;
+                return false;
+            }
+            
+            res = inflateInit2(deCompressor, -deCompressorBits);
+
+            if(res != Z_OK)
+            {
+                std::cerr << "error while initing zlib decompressor: " << res << std::endl;
+                return false;
+            }
         }
 
         //could return false to reject invalid handshakes
@@ -632,6 +1028,15 @@ public:
         if (useTLS)
         {
             tlsSession.close(clean);
+        }
+
+        if(enableDeflate)
+        {
+            deflateEnd(compressor);
+            inflateEnd(deCompressor);
+
+            free(compressor);
+            free(deCompressor);
         }
         
         s.close(clean);

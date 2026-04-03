@@ -234,8 +234,21 @@ public:
 
             if (ret == 0)
             {
-                std::cerr << "SSL receive connection closed" << std::endl;
-                return -2;
+                int mode = SSL_get_shutdown(ssl);
+                if(mode == SSL_RECEIVED_SHUTDOWN)
+                {
+                    std::cerr << "SSL receive connection closed by other side" << std::endl;
+                    return -3;
+                }
+                else if(mode == SSL_SENT_SHUTDOWN)
+                {
+                    std::cerr << "SSL receive connection closed by us" << std::endl;
+                    return -2;
+                }
+                else
+                {
+                    return -1;
+                }
             }
             else if (ret < 0)
             {
@@ -251,7 +264,7 @@ public:
                     if (!err)
                     {
                         // connection was probably just closed abruptly if there's no error
-                        return -3;
+                        return -1;
                     }
                 }
 
@@ -283,8 +296,21 @@ public:
 
             if (ret == 0)
             {
-                std::cerr << "SSL send connection closed" << std::endl;
-                return -2;
+                int mode = SSL_get_shutdown(ssl);
+                if(mode == SSL_RECEIVED_SHUTDOWN)
+                {
+                    std::cerr << "SSL send connection closed by other side" << std::endl;
+                    return -3;
+                }
+                else if(mode == SSL_SENT_SHUTDOWN)
+                {
+                    std::cerr << "SSL send connection closed by us" << std::endl;
+                    return -2;
+                }
+                else
+                {
+                    return -1;
+                }
             }
             else if (ret < 0)
             {
@@ -300,7 +326,7 @@ public:
                     if (!err)
                     {
                         // connection was probably just closed abruptly if there's no error
-                        return -3;
+                        return -1;
                     }
                 }
 

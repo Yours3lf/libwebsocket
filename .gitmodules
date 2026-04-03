@@ -1,3 +1,6 @@
 [submodule "libsocket"]
 	path = libsocket
 	url = https://github.com/Yours3lf/libsocket
+[submodule "zlib"]
+	path = zlib
+	url = https://github.com/cloudflare/zlib.git

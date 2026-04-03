@@ -151,10 +151,21 @@ class websocketServer
                             if (ret < 0)
                             {
                                 //other side closed the connection
-                                if (ret == -2 || ret == -3)
+                                if (ret == -3)
                                 {
-                                    std::cerr << "receive connection closed" << std::endl;
+                                    std::cerr << "receiveWebsocketMessage connection closed by other side" << std::endl;
+                                }
+                                else if(ret == -2)
+                                {
+                                    std::cerr << "receiveWebsocketMessage connection closed by us" << std::endl;
+                                }
+                                else
+                                {
+                                    std::cerr << "receive error " << ret << std::endl;
+                                }
 
+                                if(ret == -3 || ret == -2)
+                                {
                                     m->buf.clear();
                                     m->type = FRAME_CLOSE;
                                     thisPtr->pushMessageReceived(std::make_pair(c.first, std::move(m)));
@@ -162,10 +173,6 @@ class websocketServer
                                     thisPtr->connectionsToBeClosedMutex.lock();
                                     thisPtr->connectionsToBeClosed.push(std::make_pair(c.first, ret == -2));
                                     thisPtr->connectionsToBeClosedMutex.unlock();
-                                }
-                                else
-                                {
-                                    std::cerr << "receive error " << ret << std::endl;
                                 }
 
                                 continue;
@@ -229,10 +236,21 @@ class websocketServer
                                 if (ret < 0)
                                 {
                                     //other side closed the connection
-                                    if (ret == -2 || ret == -3)
+                                    if (ret == -3)
                                     {
-                                        std::cerr << "send connection closed" << std::endl;
+                                        std::cerr << "sendWebsocketMessage connection closed by other side" << std::endl;
+                                    }
+                                    else if(ret == -2)
+                                    {
+                                        std::cerr << "sendWebsocketMessage connection closed by us" << std::endl;
+                                    }
+                                    else
+                                    {
+                                        std::cerr << "send error " << ret << std::endl;
+                                    }
 
+                                    if(ret == -3 || ret == -2)
+                                    {
                                         m.second->buf.clear();
                                         m.second->type = FRAME_CLOSE;
                                         thisPtr->pushMessageReceived(std::move(m));
@@ -240,10 +258,6 @@ class websocketServer
                                         thisPtr->connectionsToBeClosedMutex.lock();
                                         thisPtr->connectionsToBeClosed.push(std::make_pair(it->first, ret == -2));
                                         thisPtr->connectionsToBeClosedMutex.unlock();
-                                    }
-                                    else
-                                    {
-                                        std::cerr << "send error " << ret << std::endl;
                                     }
 
                                     continue;
