@@ -150,6 +150,10 @@ private:
     bool deCompressorStream = true;
     const int32_t compressorBits = 15;
     const int32_t deCompressorBits = 15;
+    //buffer must be at least N bytes to use compression
+    //below that deflate might compress it to a larger size
+    //or just slightly smaller size and then it's not worth it
+    const uint32_t minBufferSizeForCompression = 256;
     z_stream* compressor = nullptr;
     z_stream* deCompressor = nullptr;
     const int32_t compressionLevel = Z_BEST_COMPRESSION; //max
@@ -186,7 +190,7 @@ public:
         +---------------------------------------------------------------+
         /**/
 
-        bool debugPrint = true;
+        bool debugPrint = false;
 
         uint32_t startSize = m.buf.size();
 
@@ -413,7 +417,7 @@ public:
             }
         }
 
-        if(isCompressed && m.buf.size() - startSize > 0)
+        if(isCompressed && (m.buf.size() - startSize) > 0)
         {
             if(!deCompressor)
             {
@@ -453,37 +457,40 @@ public:
             //reasonable starting decompression buf size
             deCompressionBuf.resize((m.buf.size() - startSize) * 3 + 1024);
 
-            uint32_t before = deCompressor->total_out;
+            uint32_t decompressedSize = 0;
 
             deCompressor->next_in = (unsigned char*)m.buf.data() + startSize;
             deCompressor->avail_in = m.buf.size() - startSize;
             deCompressor->next_out = (unsigned char*)deCompressionBuf.data();
             deCompressor->avail_out = deCompressionBuf.size();
             
-            int res = Z_OK;
             while(true)
             {
                 if(debugPrint)
                 {
+                    std::cout << "before: " << std::endl;
                     std::cout << "next out: " << (void*)deCompressor->next_out << std::endl;
                     std::cout << "avail_out: " << deCompressor->avail_out << std::endl;
                     std::cout << "next_in: " << (void*)deCompressor->next_in << std::endl;
                     std::cout << "avail_in: " << deCompressor->avail_in << std::endl;
                 }
 
-                res = inflate(deCompressor, Z_SYNC_FLUSH);
+                uint32_t before = deCompressor->avail_out;
+
+                int res = inflate(deCompressor, Z_SYNC_FLUSH);
+
+                decompressedSize += before - deCompressor->avail_out;
 
                 if(debugPrint)
                 {
-                    std::cout << "Decompression result: " << res << " buf size: " << deCompressionBuf.size() << std::endl;
+                    std::cout << "after: " << res << std::endl;
+                    std::cout << "next out: " << (void*)deCompressor->next_out << std::endl;
+                    std::cout << "avail_out: " << deCompressor->avail_out << std::endl;
+                    std::cout << "next_in: " << (void*)deCompressor->next_in << std::endl;
+                    std::cout << "avail_in: " << deCompressor->avail_in << std::endl;
                 }
 
-                if(res == Z_OK || res == Z_STREAM_END)
-                {
-                    if(deCompressor->avail_in == 0) break;
-                    
-                }
-                else if(res == Z_BUF_ERROR)
+                if(res == Z_BUF_ERROR || (res == Z_OK && deCompressor->avail_out == 0))
                 {
                     uint32_t oldSize = deCompressionBuf.size();
                     //double decompression buffer size and try again
@@ -492,36 +499,42 @@ public:
                     deCompressor->next_out = (Bytef*)deCompressionBuf.data() + oldSize;
                     deCompressor->avail_out = deCompressionBuf.size() - oldSize;
                 }
-                else
+                else if((res == Z_OK || res == Z_STREAM_END) && deCompressor->avail_in == 0)
                 {
+                    //status code okay and all input bytes consumed
                     break;
                 }
-            }
-
-            if(res == Z_OK)
-            {
-                uint32_t decompressedSize = deCompressor->total_out - before;
-
-                if(debugPrint)
+                else
                 {
-                    std::cout << "Decompressed buf: " << decompressedSize << std::endl;
-                    //std::cout << std::string(deCompressionBuf.begin(), deCompressionBuf.end()) << std::endl;
-                }
+                    std::cerr << "Error while running zlib decompression: " << res << std::endl;
 
-                //on success copy the decompressed data to the output message
-                m.buf.resize(startSize + decompressedSize);
-                memcpy(m.buf.data() + startSize, deCompressionBuf.data(), decompressedSize);
-
-                if(!deCompressorStream)
-                {
-                    inflateReset(deCompressor);
+                    return -1;
                 }
             }
-            else
-            {
-                std::cerr << "Error while running zlib decompression: " << res << std::endl;
 
-                return -1;
+            if(debugPrint)
+            {
+                std::cout << "Decompressed buf: " << decompressedSize << std::endl;
+                //std::cout << std::string(deCompressionBuf.begin(), deCompressionBuf.end()) << std::endl;
+            }
+
+            //on success copy the decompressed data to the output message
+            m.buf.resize(startSize + decompressedSize);
+            memcpy(m.buf.data() + startSize, deCompressionBuf.data(), decompressedSize);
+
+            if(!deCompressorStream)
+            {
+                if(inflateEnd(deCompressor) != Z_OK)
+                {
+                    std::cerr << "failed ending decompressor" << std::endl;
+                    return -1;
+                }
+
+                if(inflateInit2(deCompressor, -deCompressorBits) != Z_OK)
+                {
+                    std::cerr << "failed re-initing decompressor" << std::endl;
+                    return -1;
+                }
             }
         }
 
@@ -530,7 +543,7 @@ public:
 
     int sendWebsocketMessage(const websocketMessage& m, bool useTLS)
     {
-        bool debugPrint = true;
+        bool debugPrint = false;
 
         if (debugPrint) 
         {
@@ -548,8 +561,11 @@ public:
         const char* buf = m.buf.data();
         size_t bufSize = m.buf.size();
 
-        if(enableDeflate && buf && bufSize)
+        if(enableDeflate && buf && bufSize && bufSize >= minBufferSizeForCompression)
         {
+            //flip rsv1 bit to indicate compressed frame
+            h.rsv1 = 1;
+
             compressionBuf.resize(compressBound(m.buf.size()));
 
             compressor->next_out = (unsigned char*)compressionBuf.data();
@@ -557,20 +573,31 @@ public:
             compressor->next_in = (unsigned char*)m.buf.data();
             compressor->avail_in = m.buf.size();
 
-            uint32_t before = compressor->total_out;
-
             if(debugPrint)
             {
-                std::cout << "compression size before: " << before << std::endl;
+                std::cout << "before: " << std::endl;
                 std::cout << "next out: " << (void*)compressor->next_out << std::endl;
                 std::cout << "avail_out: " << compressor->avail_out << std::endl;
                 std::cout << "next_in: " << (void*)compressor->next_in << std::endl;
                 std::cout << "avail_in: " << compressor->avail_in << std::endl;
             }
 
-            int res = deflate(compressor, Z_SYNC_FLUSH);
+            uint32_t before = compressor->avail_out;
 
-            uint32_t compressedSize = compressor->total_out - before;
+            int flushMode = compressorStream ? Z_FULL_FLUSH : Z_SYNC_FLUSH;
+
+            int res = deflate(compressor, flushMode);
+
+            uint32_t compressedSize = before - compressor->avail_out;
+
+            if(debugPrint)
+            {
+                std::cout << "after: " << res << std::endl;
+                std::cout << "next out: " << (void*)compressor->next_out << std::endl;
+                std::cout << "avail_out: " << compressor->avail_out << std::endl;
+                std::cout << "next_in: " << (void*)compressor->next_in << std::endl;
+                std::cout << "avail_in: " << compressor->avail_in << std::endl;
+            }
 
             if(res < 0)
             {
@@ -578,53 +605,47 @@ public:
                 return -1;
             }
 
+            if(res == Z_OK && compressor->avail_out == 0)
+            {
+                std::cerr << "compressor ran out of space" << std::endl;
+                return -1;
+            }
+
+            if(compressor->avail_in > 0)
+            {
+                std::cerr << "couldn't deflate all input in one go " << compressor->avail_in << std::endl;
+                return -1;
+            }
+
             if(debugPrint)
             {
                 std::cout << "compressed size: " << compressedSize << std::endl;
+                std::cout << "before tail stripping" << std::endl;
+                for(uint32_t c = 0; c < compressedSize; ++c)
+                {
+                    printf("0x%02X ", compressionBuf[c]);
+                    //printf("%c", m.buf[c]);
+                }
+                printf("\n");
             }
 
-            //only compress the frame if we managed to make it smaller than the input data
-            if(compressedSize > 0 && compressedSize < m.buf.size())
-            {
-                if(debugPrint)
-                {
-                    std::cout << "before tail stripping" << std::endl;
-                    for(uint32_t c = 0; c < compressedSize; ++c)
-                    {
-                        printf("0x%02X ", compressionBuf[c]);
-                        //printf("%c", m.buf[c]);
-                    }
-                    printf("\n");
-                }
+            bool hasTail = true;
+            //compressionBuf.size() >= 4 &&
+            //compressionBuf[compressionBuf.size() - 4] == 0x00 &&
+            //compressionBuf[compressionBuf.size() - 3] == 0x00 &&
+            //compressionBuf[compressionBuf.size() - 2] == 0xff &&
+            //compressionBuf[compressionBuf.size() - 1] == 0xff;
 
-                //flip rsv1 bit to indicate compressed frame
-                h.rsv1 = 1;
-
-                bool hasTail = true;
-                //compressionBuf.size() >= 4 &&
-                //compressionBuf[compressionBuf.size() - 4] == 0x00 &&
-                //compressionBuf[compressionBuf.size() - 3] == 0x00 &&
-                //compressionBuf[compressionBuf.size() - 2] == 0xff &&
-                //compressionBuf[compressionBuf.size() - 1] == 0xff;
-
-                buf = compressionBuf.data();
-                bufSize = compressedSize - (hasTail ? 4 : 0); //account for flush marker
-
-                if(debugPrint)
-                {
-                    std::cout << "after tail stripping" << std::endl;
-                    for(uint32_t c = 0; c < bufSize; ++c)
-                    {
-                        printf("0x%02X ", buf[c]);
-                        //printf("%c", m.buf[c]);
-                    }
-                    printf("\n");
-                }
-            }
+            buf = compressionBuf.data();
+            bufSize = compressedSize - (hasTail ? 4 : 0); //account for flush marker
 
             if(!compressorStream)
             {
-                deflateReset(compressor);
+                if(deflateReset(compressor) != Z_OK)
+                {
+                    std::cerr << "failed resetting compressor state" << std::endl;
+                    return -1;
+                }
             }
         }
 
@@ -967,6 +988,8 @@ public:
 
         if(enableDeflate)
         {
+            assert(std::string(zlibVersion()) == std::string(ZLIB_VERSION));
+
             compressor = (z_stream*)malloc(sizeof(z_stream));
             deCompressor = (z_stream*)malloc(sizeof(z_stream));
             memset(compressor, 0, sizeof(z_stream));
