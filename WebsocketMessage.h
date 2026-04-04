@@ -15,5 +15,6 @@ enum frameType : uint8_t
 struct websocketMessage
 {
 	std::vector<char> buf;
+	uint8_t wantCompression = true;
 	frameType type;
 };

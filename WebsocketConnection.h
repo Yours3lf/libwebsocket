@@ -561,7 +561,7 @@ public:
         const char* buf = m.buf.data();
         size_t bufSize = m.buf.size();
 
-        if(enableDeflate && buf && bufSize && bufSize >= minBufferSizeForCompression)
+        if(enableDeflate && buf && bufSize && bufSize >= minBufferSizeForCompression && m.wantCompression)
         {
             //flip rsv1 bit to indicate compressed frame
             h.rsv1 = 1;
@@ -952,7 +952,7 @@ public:
                 websocketHandshakeResponse += "; client_max_window_bits=" + std::to_string(deCompressorBits);
             }
 
-            if(includeClientBitsInResponse)
+            if(includeServerBitsInResponse)
             {
                 websocketHandshakeResponse += "; server_max_window_bits=" + std::to_string(compressorBits);
             }
