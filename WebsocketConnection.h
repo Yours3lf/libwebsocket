@@ -988,7 +988,13 @@ public:
 
         if(enableDeflate)
         {
-            assert(std::string(zlibVersion()) == std::string(ZLIB_VERSION));
+            if(std::string(zlibVersion()) != std::string(ZLIB_VERSION))
+            {
+                std::cerr << "Zlib version mismatch" << std::endl;
+                std::cerr << "Zlib version compiled into: " << ZLIB_VERSION << std::endl;
+                std::cerr << "Zlib version dynamically loaded: " << zlibVersion() << std::endl; 
+                assert(0);
+            }
 
             compressor = (z_stream*)malloc(sizeof(z_stream));
             deCompressor = (z_stream*)malloc(sizeof(z_stream));
