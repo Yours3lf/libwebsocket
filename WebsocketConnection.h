@@ -1,8 +1,11 @@
 #pragma once
 
 #include "libsocket/Socket.h"
+#include "libsocket/EventWait.h"
 #include "WebsocketMessage.h"
 #include "TLSutil.h"
+
+#include <cstdint>
 
 #ifdef Z_SOLO
 #error "Z_SOLO defined, but we use standard malloc"
@@ -1039,6 +1042,11 @@ public:
     bool isOpen()
     {
         return s.isValid();
+    }
+
+    void addToWaitSet(EventWait& waitSet, uint32_t id)
+    {
+        waitSet.add(s, id);
     }
 
 	void close(bool useTLS, bool clean = true)
