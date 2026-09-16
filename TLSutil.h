@@ -50,9 +50,21 @@ public:
             }
             SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
             SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
-            SSL_CTX_set_mode(ctx, SSL_MODE_AUTO_RETRY);
+            SSL_CTX_set_mode(ctx, SSL_MODE_AUTO_RETRY | SSL_MODE_RELEASE_BUFFERS);
             SSL_CTX_set1_groups_list(ctx, "X25519");
-            SSL_CTX_set_cipher_list(ctx, "TLS_AES_128_GCM_SHA256");
+            // TLS 1.3 suites go through set_ciphersuites; set_cipher_list is 1.2-and-below.
+            if (SSL_CTX_set_ciphersuites(ctx, "TLS_AES_128_GCM_SHA256") != 1)
+            {
+                std::cerr << "SSL ctx set ciphersuites failed" << std::endl;
+                ERR_print_errors_fp(stderr);
+                return;
+            }
+            if (SSL_CTX_set_cipher_list(ctx, "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256") != 1)
+            {
+                std::cerr << "SSL ctx set cipher list failed" << std::endl;
+                ERR_print_errors_fp(stderr);
+                return;
+            }
 
             if (FILE* file = fopen(certificate.c_str(), "r"))
             {

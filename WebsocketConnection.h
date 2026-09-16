@@ -722,7 +722,7 @@ public:
         return s == c.s;
     }
 
-    bool handshake(bool useTLS)
+    bool handshake(bool useTLS, bool allowDeflate = true)
     {
         bool debugPrint = false;
 
@@ -847,7 +847,7 @@ public:
             }
         }
         
-        if(wsExtensions.find("permessage-deflate") != wsExtensions.npos)
+        if(allowDeflate && wsExtensions.find("permessage-deflate") != wsExtensions.npos)
         {
             enableDeflate = true;
         }

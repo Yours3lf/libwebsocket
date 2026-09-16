@@ -34,6 +34,7 @@ class websocketServer
 
 	bool running = true;
     bool useTLS = false;
+    bool permitDeflate = true;
 
     bool (*acceptConnectionCallback)(uint32_t, const std::string&, void*) = nullptr;
     void* acceptConnectionCallbackDataPtr = nullptr;
@@ -116,6 +117,7 @@ class websocketServer
         std::cout << "Listening thread started: " << std::hex << std::this_thread::get_id() << std::dec << std::endl;
 
         std::cout << "Secure mode: " << (thisPtr->useTLS ? "ON" : "OFF") << std::endl;
+        std::cout << "Deflate: " << (thisPtr->permitDeflate ? "ON" : "OFF") << std::endl;
         std::cout << "Binding to: " << address << ":" << port << std::endl;
 
         while (thisPtr->running)
@@ -127,6 +129,7 @@ class websocketServer
             }
 
             //likely socket is still in use
+            std::cerr << "address already in use, retrying..." << std::endl;
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
 
@@ -191,7 +194,7 @@ class websocketServer
 
             websocketConnection c(std::move(job.ss));
 
-            if (!c.handshake(thisPtr->useTLS))
+            if (!c.handshake(thisPtr->useTLS, thisPtr->permitDeflate))
             {
                 std::cout << "Handshake failed" << std::endl;
                 c.close(thisPtr->useTLS);
@@ -508,9 +511,10 @@ class websocketServer
 
 public:
 
-    websocketServer(bool secure = false) 
+    websocketServer(bool secure = false, bool allowDeflate = true)
     {
         useTLS = secure;
+        permitDeflate = allowDeflate;
     }
 
 	void run(const std::string& address, int port, bool (*acceptConnectionCallbackPtr)(uint32_t, const std::string&, void*) = nullptr, void* callbackDataPtr = nullptr)
@@ -634,6 +638,11 @@ public:
     void setMaxConnections(uint32_t n)
     {
         maxConnections = n;
+    }
+
+    void setPermitDeflate(bool allow)
+    {
+        permitDeflate = allow;
     }
 
     void setMessageReceivedHook(void (*fn)(void*), void* data)
