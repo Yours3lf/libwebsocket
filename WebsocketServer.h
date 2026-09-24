@@ -4,10 +4,16 @@
 #include "WebsocketConnection.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cassert>
+#include <iostream>
 #include <memory>
+#include <queue>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 class websocketServer
 {
@@ -32,9 +38,13 @@ class websocketServer
     std::mutex receiveMessageQueueMutex;
     std::queue<std::pair<uint32_t, std::unique_ptr<websocketMessage> > > receiveMessageQueue;
 
-	bool running = true;
+	std::atomic<bool> running{true};
     bool useTLS = false;
     bool permitDeflate = true;
+    std::atomic<int> keepaliveIntervalMs{kKeepaliveIntervalMs};
+    uint32_t maxFramePayload = kMaxFramePayload;
+    uint32_t maxMessageBytes = kMaxMessageBytes;
+    std::vector<std::string> subprotocols;
 
     bool (*acceptConnectionCallback)(uint32_t, const std::string&, void*) = nullptr;
     void* acceptConnectionCallbackDataPtr = nullptr;
@@ -193,6 +203,11 @@ class websocketServer
             std::cout << "Handshake..." << std::endl;
 
             websocketConnection c(std::move(job.ss));
+            {
+                std::lock_guard<std::mutex> guard(thisPtr->connectionsMutex);
+                c.setLimits(thisPtr->maxFramePayload, thisPtr->maxMessageBytes);
+                c.setSubprotocols(thisPtr->subprotocols);
+            }
 
             if (!c.handshake(thisPtr->useTLS, thisPtr->permitDeflate))
             {
@@ -202,6 +217,17 @@ class websocketServer
             }
 
             std::cout << "Handshake successful" << std::endl;
+
+            std::vector<std::unique_ptr<websocketMessage> > early;
+            while (c.hasBufferedInput())
+            {
+                std::unique_ptr<websocketMessage> m(new websocketMessage());
+                int drained = c.pump(*m, thisPtr->useTLS, false);
+                if (drained > 0)
+                    early.push_back(std::move(m));
+                else
+                    break;
+            }
 
             std::string url = c.getURL();
             uint32_t id = 0;
@@ -232,7 +258,12 @@ class websocketServer
                         inserted = true;
                     }
                 }
-                if (!inserted)
+                if (inserted)
+                {
+                    for (size_t i = 0; i < early.size(); ++i)
+                        thisPtr->pushMessageReceived(std::make_pair(id, std::move(early[i])));
+                }
+                else
                     c.close(thisPtr->useTLS);
             }
             else 
@@ -264,22 +295,27 @@ class websocketServer
 #endif
                 std::cout << "Receive thread started: " << std::hex << std::this_thread::get_id() << std::dec << std::endl;
 
-                uint32_t ready[64];
+                WaitResult ready[EventWait::kMaxReadyBatch];
 
                 while (thisPtr->running)
                 {
                     thisPtr->cleanUpConnections();
+                    thisPtr->serviceTimers();
 
-                    // connection ids, not poll-all / per-socket descriptors
-                    int n = thisPtr->waitSet.wait(ready, 64, -1);
+                    int timeout = thisPtr->keepaliveIntervalMs.load();
+                    if (timeout <= 0)
+                        timeout = -1;
+                    int n = thisPtr->waitSet.wait(ready, EventWait::kMaxReadyBatch, timeout);
                     if (!thisPtr->running)
                         break;
-                    if (n <= 0)
+                    if (n < 0)
+                        continue;
+                    if (n == 0)
                         continue;
 
                     for (int i = 0; i < n; ++i)
                     {
-                        uint32_t id = ready[i];
+                        uint32_t id = ready[i].id;
                         std::mutex* io = nullptr;
                         websocketConnection* connPtr = nullptr;
                         {
@@ -295,11 +331,35 @@ class websocketServer
                             thisPtr->recvInFlight.insert(id);
                         }
 
-                        std::unique_ptr<websocketMessage> m(new websocketMessage());
                         int ret = 0;
                         {
                             std::lock_guard<std::mutex> ioGuard(*io);
-                            ret = connPtr->receiveWebsocketMessage(*m, thisPtr->useTLS);
+                            if (ready[i].writable)
+                            {
+                                int flushed = connPtr->flushSend(thisPtr->useTLS);
+                                bool pending = connPtr->hasPendingSend();
+                                connPtr->noteWriteInterest(thisPtr->waitSet, id, pending);
+                                if (flushed < 0 && flushed != socket::kWouldBlock)
+                                    ret = flushed;
+                            }
+                            bool readSocket = ready[i].readable || connPtr->hasBufferedInput();
+                            while (ret == 0 && readSocket)
+                            {
+                                std::unique_ptr<websocketMessage> m(new websocketMessage());
+                                ret = connPtr->pump(*m, thisPtr->useTLS, true);
+                                readSocket = false;
+                                if (ret > 0)
+                                {
+                                    if (m->type == FRAME_TEXT)
+                                        std::cout << "Text frame received " << m->buf.size() << " bytes" << std::endl;
+                                    else if (m->type == FRAME_BINARY)
+                                        std::cout << "Binary frame received " << m->buf.size() << " bytes" << std::endl;
+                                    thisPtr->pushMessageReceived(std::make_pair(id, std::move(m)));
+                                    ret = 0;
+                                    if (connPtr->hasBufferedInput())
+                                        readSocket = true;
+                                }
+                            }
                         }
 
                         {
@@ -314,59 +374,32 @@ class websocketServer
                             }
                         }
 
-                        //error happened
+                        if (ret == socket::kWouldBlock || ret == 0)
+                            continue;
+
                         if (ret < 0)
                         {
-                            //other side closed the connection
                             if (ret == -3)
-                            {
                                 std::cerr << "receiveWebsocketMessage connection closed by other side" << std::endl;
-                            }
-                            else if(ret == -2)
-                            {
+                            else if (ret == -2)
                                 std::cerr << "receiveWebsocketMessage connection closed by us" << std::endl;
-                            }
-                            else
-                            {
+                            else if (ret != kCloseQuiet)
                                 std::cerr << "receive error " << ret << std::endl;
+
+                            if (ret == -3 || ret == -2)
+                            {
+                                std::unique_ptr<websocketMessage> closed(new websocketMessage());
+                                closed->buf.clear();
+                                closed->type = FRAME_CLOSE;
+                                thisPtr->pushMessageReceived(std::make_pair(id, std::move(closed)));
                             }
 
-                            if(ret == -3 || ret == -2)
+                            if (ret == -3 || ret == -2 || ret == kCloseQuiet)
                             {
-                                m->buf.clear();
-                                m->type = FRAME_CLOSE;
-                                thisPtr->pushMessageReceived(std::make_pair(id, std::move(m)));
-
                                 thisPtr->connectionsToBeClosedMutex.lock();
                                 thisPtr->connectionsToBeClosed.push(std::make_pair(id, ret == -2));
                                 thisPtr->connectionsToBeClosedMutex.unlock();
                             }
-
-                            continue;
-                        }
-
-                        switch (m->type)
-                        {
-                        case FRAME_TEXT:
-                        {
-                            std::cout << "Text frame received " << m->buf.size() << " bytes" << std::endl;
-
-                            thisPtr->pushMessageReceived(std::make_pair(id, std::move(m)));
-                            break;
-                        }
-                        case FRAME_BINARY:
-                        {
-                            std::cout << "Binary frame received " << m->buf.size() << " bytes" << std::endl;
-                            //printRawData(m->buf);
-
-                            thisPtr->pushMessageReceived(std::make_pair(id, std::move(m)));
-                            break;
-                        }
-                        default:
-                        {
-                            std::cerr << "got unknown frame, ignoring" << std::endl;
-                            break;
-                        }
                         }
                     }
                 }
@@ -425,6 +458,8 @@ class websocketServer
                         {
                             std::lock_guard<std::mutex> ioGuard(*io);
                             ret = connPtr->sendWebsocketMessage(*m.second, thisPtr->useTLS);
+                            if (connPtr->isOpen())
+                                connPtr->noteWriteInterest(thisPtr->waitSet, m.first, connPtr->hasPendingSend());
                         }
 
                         {
@@ -438,6 +473,9 @@ class websocketServer
                                 thisPtr->finishCloseLocked(m.first, clean);
                             }
                         }
+
+                        if (ret == socket::kWouldBlock)
+                            continue;
 
                         //error happened
                         if (ret < 0)
@@ -495,6 +533,77 @@ class websocketServer
         receiveMessageQueue.push(std::move(m));
         if (messageReceivedHook)
             messageReceivedHook(messageReceivedHookData);
+    }
+
+    void serviceTimers()
+    {
+        auto now = std::chrono::steady_clock::now();
+        int interval = keepaliveIntervalMs.load();
+        std::vector<uint32_t> ids;
+        {
+            std::lock_guard<std::mutex> guard(connectionsMutex);
+            for (auto& c : connections)
+                ids.push_back(c.first);
+        }
+
+        for (size_t i = 0; i < ids.size(); ++i)
+        {
+            uint32_t id = ids[i];
+            std::mutex* io = nullptr;
+            websocketConnection* connPtr = nullptr;
+            {
+                std::lock_guard<std::mutex> guard(connectionsMutex);
+                auto it = connections.find(id);
+                if (it == connections.end() || !it->second.isOpen())
+                    continue;
+                if (recvInFlight.find(id) != recvInFlight.end() || sendInFlight.find(id) != sendInFlight.end())
+                    continue;
+                auto mit = connIoMutex.find(id);
+                if (mit == connIoMutex.end() || !mit->second)
+                    continue;
+                io = mit->second.get();
+                connPtr = &it->second;
+                recvInFlight.insert(id);
+            }
+
+            int ret = 0;
+            bool timedOut = false;
+            {
+                std::lock_guard<std::mutex> ioGuard(*io);
+                timedOut = connPtr->closeTimedOut(now);
+                if (!timedOut)
+                    ret = connPtr->serviceKeepalive(useTLS, now, interval);
+                if (connPtr->isOpen() && connPtr->hasPendingSend())
+                    connPtr->noteWriteInterest(waitSet, id, true);
+            }
+
+            {
+                std::lock_guard<std::mutex> guard(connectionsMutex);
+                recvInFlight.erase(id);
+                auto dit = deferredClose.find(id);
+                if (dit != deferredClose.end() && sendInFlight.find(id) == sendInFlight.end())
+                {
+                    bool clean = dit->second;
+                    finishCloseLocked(id, clean);
+                    continue;
+                }
+                if (timedOut)
+                {
+                    finishCloseLocked(id, false);
+                    continue;
+                }
+            }
+
+            if (ret == -2 || ret == -3)
+            {
+                std::unique_ptr<websocketMessage> closed(new websocketMessage());
+                closed->type = FRAME_CLOSE;
+                pushMessageReceived(std::make_pair(id, std::move(closed)));
+                connectionsToBeClosedMutex.lock();
+                connectionsToBeClosed.push(std::make_pair(id, ret == -2));
+                connectionsToBeClosedMutex.unlock();
+            }
+        }
     }
 
     void cleanUpConnections()
@@ -609,7 +718,14 @@ public:
             deferredClose[c] = clean;
             return;
         }
-        finishCloseLocked(c, clean);
+        auto it = connections.find(c);
+        if (it == connections.end())
+            return;
+        int rc = it->second.beginLocalClose(useTLS, clean);
+        if (it->second.isOpen() && it->second.hasPendingSend())
+            it->second.noteWriteInterest(waitSet, c, true);
+        if (rc == kCloseQuiet)
+            finishCloseLocked(c, false);
     }
 
     std::string getConnectionURL(uint32_t c)
@@ -643,6 +759,37 @@ public:
     void setPermitDeflate(bool allow)
     {
         permitDeflate = allow;
+    }
+
+    void setMaxFramePayload(uint32_t n)
+    {
+        std::lock_guard<std::mutex> guard(connectionsMutex);
+        if (n == 0)
+            return;
+        maxFramePayload = n;
+        for (auto &c : connections)
+            c.second.setLimits(n, maxMessageBytes);
+    }
+
+    void setMaxMessageBytes(uint32_t n)
+    {
+        std::lock_guard<std::mutex> guard(connectionsMutex);
+        if (n == 0)
+            return;
+        maxMessageBytes = n;
+        for (auto &c : connections)
+            c.second.setLimits(maxFramePayload, n);
+    }
+
+    void setKeepaliveIntervalMs(int ms)
+    {
+        keepaliveIntervalMs.store(ms);
+    }
+
+    void setSubprotocols(std::vector<std::string> protocols)
+    {
+        std::lock_guard<std::mutex> guard(connectionsMutex);
+        subprotocols = std::move(protocols);
     }
 
     void setMessageReceivedHook(void (*fn)(void*), void* data)

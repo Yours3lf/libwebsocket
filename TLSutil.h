@@ -50,16 +50,17 @@ public:
             }
             SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
             SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
-            SSL_CTX_set_mode(ctx, SSL_MODE_AUTO_RETRY | SSL_MODE_RELEASE_BUFFERS);
-            SSL_CTX_set1_groups_list(ctx, "X25519");
+            SSL_CTX_set_mode(ctx, SSL_MODE_AUTO_RETRY | SSL_MODE_RELEASE_BUFFERS |
+                SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+            SSL_CTX_set1_groups_list(ctx, "X25519:P-256");
             // TLS 1.3 suites go through set_ciphersuites; set_cipher_list is 1.2-and-below.
-            if (SSL_CTX_set_ciphersuites(ctx, "TLS_AES_128_GCM_SHA256") != 1)
+            if (SSL_CTX_set_ciphersuites(ctx, "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256") != 1)
             {
                 std::cerr << "SSL ctx set ciphersuites failed" << std::endl;
                 ERR_print_errors_fp(stderr);
                 return;
             }
-            if (SSL_CTX_set_cipher_list(ctx, "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256") != 1)
+            if (SSL_CTX_set_cipher_list(ctx, "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305") != 1)
             {
                 std::cerr << "SSL ctx set cipher list failed" << std::endl;
                 ERR_print_errors_fp(stderr);
@@ -84,7 +85,7 @@ public:
                 std::cerr << "Can't open privateKey using file: " << privateKey << std::endl;
             }
 
-            if (SSL_CTX_use_certificate_file(ctx, certificate.c_str(), SSL_FILETYPE_PEM) <= 0)
+            if (SSL_CTX_use_certificate_chain_file(ctx, certificate.c_str()) <= 0)
             {
                 std::cerr << "SSL ctx use certificate failed" << std::endl;
                 ERR_print_errors_fp(stderr);
@@ -151,7 +152,8 @@ public:
                 int errorCode = SSL_get_error(ssl, ret);
                 if (errorCode == SSL_ERROR_WANT_READ || errorCode == SSL_ERROR_WANT_WRITE)
                 {
-                    continue; //Try again
+                    // More socket data is required. Do not spin.
+                    return bytesReceived > 0 ? bytesReceived : socket::kWouldBlock;
                 }
                 else if (errorCode == SSL_ERROR_SYSCALL)
                 {
@@ -165,7 +167,6 @@ public:
                 }
 
                 std::cerr << "SSL receive failed " << errorCode << std::endl;
-                checkErrorMessage(errorCode);
                 ERR_print_errors_fp(stderr);
                 return -1;
             }
@@ -213,7 +214,7 @@ public:
                 int errorCode = SSL_get_error(ssl, ret);
                 if (errorCode == SSL_ERROR_WANT_READ || errorCode == SSL_ERROR_WANT_WRITE)
                 {
-                    continue; //Try again
+                    return bytesSent > 0 ? bytesSent : socket::kWouldBlock;
                 }
                 else if (errorCode == SSL_ERROR_SYSCALL)
                 {
@@ -227,7 +228,6 @@ public:
                 }
 
                 std::cerr << "SSL send failed " << errorCode << std::endl;
-                checkErrorMessage(errorCode);
                 ERR_print_errors_fp(stderr);
                 return -1;
             }
@@ -282,32 +282,58 @@ public:
 
     void close(bool clean = true)
     {
-        if (ssl) 
-        {
-            if(!clean)
-            {
-                SSL_free(ssl);
-                return;
-            }
+        if (!ssl)
+            return;
 
+        if (clean)
+        {
             int ret = SSL_shutdown(ssl);
-            
-            if (ret == 0) 
-            {
-                return; //we'll need to wait for a response, so keep it open for now
-            }
-            else if (ret == 1) 
-            {
-                SSL_free(ssl); //shutdown complete, free resource
-            }
-            else
+            // ret 0 means the peer close_notify is still outstanding. The TCP
+            // socket is closed by the caller, so the SSL object must not leak.
+            if (ret < 0)
             {
                 int errorCode = SSL_get_error(ssl, ret);
-                std::cerr << "SSL shutdown failed " << errorCode << std::endl;
-                checkErrorMessage(errorCode);
-                ERR_print_errors_fp(stderr);
+                if (errorCode != SSL_ERROR_WANT_READ && errorCode != SSL_ERROR_WANT_WRITE)
+                {
+                    std::cerr << "SSL shutdown failed " << errorCode << std::endl;
+                    ERR_print_errors_fp(stderr);
+                }
             }
         }
+
+        SSL_free(ssl);
+        ssl = nullptr;
+    }
+
+    TLSsession() = default;
+
+    ~TLSsession()
+    {
+        if (ssl)
+        {
+            SSL_free(ssl);
+            ssl = nullptr;
+        }
+    }
+
+    TLSsession(const TLSsession&) = delete;
+    TLSsession& operator=(const TLSsession&) = delete;
+
+    TLSsession(TLSsession&& other) noexcept
+        : ssl(other.ssl)
+    {
+        other.ssl = nullptr;
+    }
+
+    TLSsession& operator=(TLSsession&& other) noexcept
+    {
+        if (this != &other)
+        {
+            close(false);
+            ssl = other.ssl;
+            other.ssl = nullptr;
+        }
+        return *this;
     }
 };
 
