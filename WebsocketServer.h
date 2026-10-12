@@ -29,6 +29,10 @@ class websocketServer
 
     std::mutex connectionsMutex;
 	std::unordered_map<uint32_t, websocketConnection> connections;
+	// Peer address captured at accept, keyed by connection id. The handshake
+	// callback runs before the connection is inserted, so the address has to
+	// be stored first.
+	std::unordered_map<uint32_t, std::string> peerByConn;
     std::mutex connectionsToBeClosedMutex;
     std::queue<std::pair<uint32_t, bool> > connectionsToBeClosed; // connection id, close clean
 
@@ -108,11 +112,13 @@ class websocketServer
         {
             reservedConnIds.erase(c);
             deferredClose.erase(c);
+            peerByConn.erase(c);
             return;
         }
         waitSet.remove(c);
         it->second.close(useTLS, clean);
         connections.erase(it);
+        peerByConn.erase(c);
         connIoMutex.erase(c);
         reservedConnIds.erase(c);
         deferredClose.erase(c);
@@ -234,6 +240,7 @@ class websocketServer
             {
                 std::lock_guard<std::mutex> guard(thisPtr->connectionsMutex);
                 id = thisPtr->allocConnIdLocked();
+                thisPtr->peerByConn[id] = job.address;
             }
 
             if(!thisPtr->acceptConnectionCallback ||
@@ -247,6 +254,7 @@ class websocketServer
                     {
                         std::cerr << "Too many connections " << thisPtr->connections.size() << "/" << thisPtr->maxConnections << std::endl;
                         thisPtr->reservedConnIds.erase(id);
+                        thisPtr->peerByConn.erase(id);
                     }
                     else
                     {
@@ -272,6 +280,7 @@ class websocketServer
                 {
                     std::lock_guard<std::mutex> guard(thisPtr->connectionsMutex);
                     thisPtr->reservedConnIds.erase(id);
+                    thisPtr->peerByConn.erase(id);
                 }
                 c.close(thisPtr->useTLS);
             }
@@ -684,6 +693,7 @@ public:
                 c.second.close(useTLS);
             }
             connections.clear();
+            peerByConn.clear();
             connIoMutex.clear();
             recvInFlight.clear();
             sendInFlight.clear();
@@ -737,6 +747,17 @@ public:
             return it->second.getURL();
         }
         return "";
+    }
+
+    // Address from accept(), including the family prefix and port.
+    // Empty when this id was not accepted on this server.
+    std::string peerAddress(uint32_t c)
+    {
+        std::lock_guard<std::mutex> guard(connectionsMutex);
+        auto it = peerByConn.find(c);
+        if (it == peerByConn.end())
+            return "";
+        return it->second;
     }
 
 	bool hasConnections()
