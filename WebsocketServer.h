@@ -48,6 +48,11 @@ class websocketServer
     std::atomic<int> keepaliveIntervalMs{kKeepaliveIntervalMs};
     uint32_t maxFramePayload = kMaxFramePayload;
     uint32_t maxMessageBytes = kMaxMessageBytes;
+    // Message cap a new connection starts with; 0 means maxMessageBytes. An owner
+    // that authenticates connections starts them small and raises each one with
+    // setConnectionMaxMessageBytes, so a client that never authenticates cannot
+    // make the server buffer a maxMessageBytes message.
+    uint32_t initialMaxMessageBytes = 0;
     std::vector<std::string> subprotocols;
 
     bool (*acceptConnectionCallback)(uint32_t, const std::string&, void*) = nullptr;
@@ -211,7 +216,9 @@ class websocketServer
             websocketConnection c(std::move(job.ss));
             {
                 std::lock_guard<std::mutex> guard(thisPtr->connectionsMutex);
-                c.setLimits(thisPtr->maxFramePayload, thisPtr->maxMessageBytes);
+                const uint32_t startBytes =
+                    thisPtr->initialMaxMessageBytes != 0 ? thisPtr->initialMaxMessageBytes : thisPtr->maxMessageBytes;
+                c.setLimits(thisPtr->maxFramePayload, startBytes);
                 c.setSubprotocols(thisPtr->subprotocols);
             }
 
@@ -792,6 +799,8 @@ public:
             c.second.setLimits(n, maxMessageBytes);
     }
 
+    // Startup setting. It also resets every open connection to n, including one
+    // raised or lowered with setConnectionMaxMessageBytes.
     void setMaxMessageBytes(uint32_t n)
     {
         std::lock_guard<std::mutex> guard(connectionsMutex);
@@ -800,6 +809,25 @@ public:
         maxMessageBytes = n;
         for (auto &c : connections)
             c.second.setLimits(maxFramePayload, n);
+    }
+
+    // Startup setting: the message cap new connections start with (see initialMaxMessageBytes).
+    void setInitialMaxMessageBytes(uint32_t n)
+    {
+        std::lock_guard<std::mutex> guard(connectionsMutex);
+        initialMaxMessageBytes = n;
+    }
+
+    // Sets one open connection's message cap; 0 means maxMessageBytes. False when
+    // the connection is gone. A receive in flight sees the new cap on its next check.
+    bool setConnectionMaxMessageBytes(uint32_t c, uint32_t n)
+    {
+        std::lock_guard<std::mutex> guard(connectionsMutex);
+        auto it = connections.find(c);
+        if (it == connections.end())
+            return false;
+        it->second.setLimits(0, n != 0 ? n : maxMessageBytes);
+        return true;
     }
 
     void setKeepaliveIntervalMs(int ms)

@@ -5,6 +5,7 @@
 #include "WebsocketMessage.h"
 #include "TLSutil.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -334,7 +335,9 @@ class websocketConnection
     std::vector<std::string> subprotocols;
 
     uint32_t maxFramePayload = kMaxFramePayload;
-    uint32_t maxMessageBytes = kMaxMessageBytes;
+    // Atomic: the receive thread reads it while the owner raises it, for example
+    // once a connection has authenticated.
+    std::atomic<uint32_t> maxMessageBytes{kMaxMessageBytes};
 
     bool closeFrameSent = false;
     bool localClose = false;
@@ -921,7 +924,7 @@ public:
         , origin(std::move(other.origin))
         , subprotocols(std::move(other.subprotocols))
         , maxFramePayload(other.maxFramePayload)
-        , maxMessageBytes(other.maxMessageBytes)
+        , maxMessageBytes(other.maxMessageBytes.load())
         , closeFrameSent(other.closeFrameSent)
         , localClose(other.localClose)
         , sawPeerClose(other.sawPeerClose)
@@ -966,7 +969,7 @@ public:
             origin = std::move(other.origin);
             subprotocols = std::move(other.subprotocols);
             maxFramePayload = other.maxFramePayload;
-            maxMessageBytes = other.maxMessageBytes;
+            maxMessageBytes.store(other.maxMessageBytes.load());
             closeFrameSent = other.closeFrameSent;
             localClose = other.localClose;
             sawPeerClose = other.sawPeerClose;
@@ -987,7 +990,7 @@ public:
         if (framePayload > 0)
             maxFramePayload = framePayload;
         if (messageBytes > 0)
-            maxMessageBytes = messageBytes;
+            maxMessageBytes.store(messageBytes);
     }
 
     void setSubprotocols(std::vector<std::string> protocols)
