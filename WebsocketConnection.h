@@ -5,6 +5,7 @@
 #include "WebsocketMessage.h"
 #include "TLSutil.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -25,6 +26,9 @@ static const uint32_t kMaxFramePayload = 64u * 1024u;
 // Reassembled message cap. Media blobs in Media.h run about 2-3MB, so 16MiB
 // leaves room for that payload plus the binary envelope.
 static const uint32_t kMaxMessageBytes = 16u * 1024u * 1024u;
+// Unsent bytes one connection may hold. A peer that stopped reading kept every
+// later message in memory without a limit; past this the connection closes.
+static const size_t kMaxPendingSendBytes = 32u * 1024u * 1024u;
 // HTTP upgrade request cap. A browser handshake is a few hundred bytes.
 static const uint32_t kMaxHandshakeBytes = 16u * 1024u;
 // Bytes pulled from the socket on one readable event.
@@ -44,6 +48,7 @@ static const uint16_t kCloseNormal = 1000;       // normal closure
 static const uint16_t kCloseGoingAway = 1001;    // endpoint going away (missed pong)
 static const uint16_t kCloseProtocol = 1002;     // protocol error
 static const uint16_t kCloseBadPayload = 1007;   // invalid UTF-8 text, or close reason
+static const uint16_t kClosePolicy = 1008;       // policy violation (peer not reading)
 static const uint16_t kCloseTooBig = 1009;       // message too big
 // RFC 6455 section 7.4.1: must not appear in a Close frame on the wire.
 static const uint16_t kCloseReserved = 1004;
@@ -309,6 +314,9 @@ class websocketConnection
     std::vector<char> readBuf;
     size_t readPos = 0;
     std::vector<char> pendingOut;
+    // Bytes at the front of pendingOut already sent. Erasing them after every partial
+    // send moved the whole backlog each time; the sent prefix goes once it is half.
+    size_t pendingOutHead = 0;
 
     bool assembling = false;
     frameType assembleType = FRAME_TEXT;
@@ -430,17 +438,26 @@ class websocketConnection
 
     int flushPendingSend(bool useTLS)
     {
-        while (!pendingOut.empty())
+        while (pendingOutHead < pendingOut.size())
         {
-            int n = sendSome(pendingOut.data(), (int)pendingOut.size(), useTLS);
+            int n = sendSome(pendingOut.data() + pendingOutHead, (int)(pendingOut.size() - pendingOutHead), useTLS);
             if (n == socket::kWouldBlock)
+            {
+                if (pendingOutHead * 2 >= pendingOut.size())
+                {
+                    pendingOut.erase(pendingOut.begin(), pendingOut.begin() + (std::ptrdiff_t)pendingOutHead);
+                    pendingOutHead = 0;
+                }
                 return socket::kWouldBlock;
+            }
             if (n < 0)
                 return n;
             if (n == 0)
                 return -1;
-            pendingOut.erase(pendingOut.begin(), pendingOut.begin() + n);
+            pendingOutHead += (size_t)n;
         }
+        pendingOut.clear();
+        pendingOutHead = 0;
         return 0;
     }
 
@@ -473,6 +490,9 @@ class websocketConnection
         return buffered() >= n;
     }
 
+    // inflateMessage's answer for a message that inflates past maxMessageBytes.
+    static constexpr int kInflateTooBig = -2;
+
     int inflateMessage(size_t plainStart, std::vector<char>& dest)
     {
         if (!deCompressor)
@@ -485,8 +505,14 @@ class websocketConnection
         std::vector<char> appendix = {0x00, 0x00, (char)0xff, (char)0xff};
         dest.insert(dest.end(), appendix.begin(), appendix.end());
 
+        // The cap applies to the inflated bytes. A message under the cap on the wire could
+        // inflate about a thousand times over (16 MB to 16 GB), and the size was only
+        // checked once all of it had been inflated. One byte past the cap is enough to
+        // know the message is too big.
+        const size_t inflatedCap = (size_t)maxMessageBytes.load() + 1;
+
         // reasonable starting decompression buf size
-        deCompressionBuf.resize((dest.size() - plainStart) * 3 + 1024);
+        deCompressionBuf.resize(std::min(inflatedCap, (dest.size() - plainStart) * 3 + 1024));
         uint32_t decompressedSize = 0;
         deCompressor->next_in = (unsigned char*)dest.data() + plainStart;
         deCompressor->avail_in = (uInt)(dest.size() - plainStart);
@@ -498,11 +524,23 @@ class websocketConnection
             uInt before = deCompressor->avail_out;
             int res = inflate(deCompressor.get(), Z_SYNC_FLUSH);
             decompressedSize += before - deCompressor->avail_out;
+            if (res == Z_BUF_ERROR && deCompressor->avail_in == 0 && deCompressor->avail_out > 0)
+            {
+                // Every input byte is used and nothing more came out: the message ended at the
+                // sync flush. This is the call after the output filled exactly; growing the
+                // buffer again here never ended.
+                break;
+            }
             if (res == Z_BUF_ERROR || (res == Z_OK && deCompressor->avail_out == 0))
             {
+                if (deCompressionBuf.size() >= inflatedCap)
+                {
+                    std::cerr << "inflated message is over the message cap" << std::endl;
+                    return kInflateTooBig;
+                }
                 uint32_t oldSize = (uint32_t)deCompressionBuf.size();
-                // double decompression buffer size and try again
-                deCompressionBuf.resize(deCompressionBuf.size() * 2);
+                // double decompression buffer size and try again, up to the cap
+                deCompressionBuf.resize(std::min(inflatedCap, deCompressionBuf.size() * 2));
                 deCompressor->next_out = (Bytef*)deCompressionBuf.data() + oldSize;
                 deCompressor->avail_out = (uInt)(deCompressionBuf.size() - oldSize);
             }
@@ -537,7 +575,10 @@ class websocketConnection
     {
         if (assembleCompressed)
         {
-            if (inflateMessage(0, assembleBuf) != 0)
+            const int inflated = inflateMessage(0, assembleBuf);
+            if (inflated == kInflateTooBig)
+                return fail(kCloseTooBig, useTLS);
+            if (inflated != 0)
                 return fail(kCloseProtocol, useTLS);
         }
         if (assembleType == FRAME_TEXT && !isValidUtf8(assembleBuf.data(), assembleBuf.size()))
@@ -906,6 +947,7 @@ public:
         , readBuf(std::move(other.readBuf))
         , readPos(other.readPos)
         , pendingOut(std::move(other.pendingOut))
+        , pendingOutHead(other.pendingOutHead)
         , assembling(other.assembling)
         , assembleType(other.assembleType)
         , assembleCompressed(other.assembleCompressed)
@@ -934,6 +976,7 @@ public:
         , awaitingPong(other.awaitingPong)
     {
         other.readPos = 0;
+        other.pendingOutHead = 0;
         other.enableDeflate = false;
         other.assembling = false;
         other.closeFrameSent = false;
@@ -951,6 +994,7 @@ public:
             readBuf = std::move(other.readBuf);
             readPos = other.readPos;
             pendingOut = std::move(other.pendingOut);
+            pendingOutHead = other.pendingOutHead;
             assembling = other.assembling;
             assembleType = other.assembleType;
             assembleCompressed = other.assembleCompressed;
@@ -978,6 +1022,7 @@ public:
             pingSent = other.pingSent;
             awaitingPong = other.awaitingPong;
             other.readPos = 0;
+            other.pendingOutHead = 0;
             other.enableDeflate = false;
             other.closeFrameSent = false;
             other.localClose = false;
@@ -1037,6 +1082,11 @@ public:
 
         if (control && bufSize > 125)
             return fail(kCloseProtocol, useTLS);
+        if (!control && pendingOut.size() - pendingOutHead + bufSize > kMaxPendingSendBytes)
+        {
+            std::cerr << "Websocket peer is not reading: over " << kMaxPendingSendBytes << " bytes unsent" << std::endl;
+            return fail(kClosePolicy, useTLS);
+        }
 
         size_t offset = 0;
         bool first = true;
@@ -1073,7 +1123,7 @@ public:
 
     bool hasPendingSend() const
     {
-        return !pendingOut.empty();
+        return pendingOutHead < pendingOut.size();
     }
 
     bool hasBufferedInput() const
