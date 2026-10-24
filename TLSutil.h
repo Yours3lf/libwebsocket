@@ -2,6 +2,8 @@
 
 #include "libsocket/Socket.h"
 
+#include <chrono>
+#include <thread>
 #include <vector>
 #include <random>
 
@@ -238,8 +240,11 @@ public:
         return bytesSent;
     }
 
-    bool handshake(class socket& s)
-    {     
+    // Runs the server side of the TLS handshake on a non-blocking socket and gives up at
+    // deadline. A blocking SSL_accept waited for the ClientHello for as long as the peer
+    // liked, so a few connections that sent nothing held every handshake thread.
+    bool handshake(class socket& s, std::chrono::steady_clock::time_point deadline)
+    {
         if (!ctx || !inited || ssl) return false;
 
         ssl =  SSL_new(ctx);
@@ -260,16 +265,36 @@ public:
 
         SSL_set_accept_state(ssl);
 
-        if (SSL_accept(ssl) <= 0)
+        for (;;)
         {
+            const int ret = SSL_accept(ssl);
+            if (ret == 1)
+                break;
+            const int errorCode = SSL_get_error(ssl, ret);
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline)
+            {
+                std::cerr << "SSL handshake timed out" << std::endl;
+                return false;
+            }
+            const int remainingMs =
+                (int)std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count() + 1;
+            if (errorCode == SSL_ERROR_WANT_READ)
+            {
+                if (s.waitReadable(remainingMs) <= 0)
+                {
+                    std::cerr << "SSL handshake timed out" << std::endl;
+                    return false;
+                }
+                continue;
+            }
+            if (errorCode == SSL_ERROR_WANT_WRITE)
+            {
+                // The send buffer is full; it drains in well under the deadline.
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                continue;
+            }
             std::cerr << "SSL accept failed" << std::endl;
-            ERR_print_errors_fp(stderr);
-            return false;
-        }
-
-        if (SSL_do_handshake(ssl) <= 0)
-        {
-            std::cerr << "SSL do handshake failed" << std::endl;
             ERR_print_errors_fp(stderr);
             return false;
         }

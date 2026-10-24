@@ -7,6 +7,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cassert>
+#include <deque>
 #include <iostream>
 #include <memory>
 #include <queue>
@@ -21,6 +22,7 @@ class websocketServer
 	{
 		class socket ss;
 		std::string address;
+		std::string host;
 	};
 
 	class socket listeningSocket;
@@ -67,11 +69,94 @@ class websocketServer
     std::atomic<uint32_t> nextConnId{0};
     uint32_t maxConnections = 500000;
 
+    // One host's handshakes: the ones running and the ones waiting their turn.
+    struct HandshakeHost
+    {
+        std::deque<HandshakeJob> waiting;
+        uint32_t running = 0;
+        // In readyHosts: a job is waiting and a running slot is free.
+        bool ready = false;
+    };
+
     std::mutex handshakeMutex;
     std::condition_variable handshakeCv;
-    std::queue<HandshakeJob> handshakeQueue;
-    static const int kHandshakeThreadCount = 4;
-    std::thread handshakeThreads[4];
+    // A handshake holds its thread for its round trips (TLS, then the HTTP request), about
+    // half a second on a slow link, and the threads sleep in poll meanwhile. Sixteen let a
+    // gateway finish a few dozen handshakes a second, so a reconnect after a restart queued
+    // for minutes.
+    static const int kHandshakeThreadCount = 64;
+    std::thread handshakeThreads[kHandshakeThreadCount];
+    // Every handshake ends within kHandshakeTimeoutMs, but a host that opened sockets and
+    // sent nothing held every thread until then, and the sockets it kept opening queued
+    // ahead of everyone else's. A host now runs a few handshakes at a time, the threads take
+    // hosts in turn, and the host's other sockets wait in its own line.
+    static const uint32_t kMaxRunningHandshakesPerHost = 4;
+    static const size_t kMaxWaitingHandshakesPerHost = 256;
+    static const size_t kMaxPendingHandshakes = 4096;
+    std::unordered_map<std::string, HandshakeHost> handshakeHosts;
+    // Hosts with a handshake to start, in turn order.
+    std::deque<std::string> readyHosts;
+    // Handshakes waiting or running, all hosts.
+    size_t handshakesPending = 0;
+
+    // The host of an accept address ("AF ipv4 203.0.113.8:40000"): the port is dropped. An
+    // IPv6 host is keyed by its /64, which one subscriber holds whole, and an IPv4 address
+    // carried in IPv6 (::ffff:a.b.c.d on a dual-stack listener) by that IPv4 address.
+    static std::string handshakeHostKey(const std::string& address)
+    {
+        const size_t space = address.rfind(' ');
+        std::string host = space == std::string::npos ? address : address.substr(space + 1);
+        const size_t colon = host.rfind(':');
+        if (colon != std::string::npos)
+            host.resize(colon);
+        if (address.find(" ipv6 ") == std::string::npos)
+            return host;
+        in6_addr parsed{};
+        if (inet_pton(AF_INET6, host.c_str(), &parsed) != 1)
+            return host;
+        if (IN6_IS_ADDR_V4MAPPED(&parsed))
+            return host.substr(host.rfind(':') + 1);
+        static const char kHex[] = "0123456789abcdef";
+        std::string key = "ipv6/64 ";
+        for (int i = 0; i < 8; ++i)
+        {
+            key.push_back(kHex[parsed.s6_addr[i] >> 4]);
+            key.push_back(kHex[parsed.s6_addr[i] & 0x0f]);
+        }
+        return key;
+    }
+
+    // Puts a host in line when it has a job waiting and a running slot free. Caller holds
+    // handshakeMutex.
+    void queueHostLocked(const std::string& key, HandshakeHost& host)
+    {
+        if (host.ready || host.waiting.empty() || host.running >= kMaxRunningHandshakesPerHost)
+            return;
+        host.ready = true;
+        readyHosts.push_back(key);
+    }
+
+    // Takes one finished handshake off its host. True when that put the host back in line,
+    // so a thread should wake for it. Caller holds handshakeMutex.
+    bool finishHandshakeLocked(const std::string& key)
+    {
+        if (handshakesPending > 0)
+            handshakesPending -= 1;
+        auto found = handshakeHosts.find(key);
+        if (found == handshakeHosts.end())
+            return false;
+        HandshakeHost& host = found->second;
+        if (host.running > 0)
+            host.running -= 1;
+        if (host.running == 0 && host.waiting.empty())
+        {
+            handshakeHosts.erase(found);
+            return false;
+        }
+        const bool wasReady = host.ready;
+        queueHostLocked(key, host);
+        return !wasReady && host.ready;
+    }
 
     uint32_t pickID()
     {
@@ -172,12 +257,31 @@ class websocketServer
                     continue;
                 }
 
-                HandshakeJob job;
-                job.ss = std::move(ss);
-                job.address = newAddress;
+                const std::string key = handshakeHostKey(newAddress);
+                bool queued = false;
                 {
                     std::lock_guard<std::mutex> guard(thisPtr->handshakeMutex);
-                    thisPtr->handshakeQueue.push(std::move(job));
+                    HandshakeHost& host = thisPtr->handshakeHosts[key];
+                    if (thisPtr->handshakesPending < kMaxPendingHandshakes &&
+                        host.waiting.size() < kMaxWaitingHandshakesPerHost)
+                    {
+                        HandshakeJob job;
+                        job.ss = std::move(ss);
+                        job.address = newAddress;
+                        job.host = key;
+                        host.waiting.push_back(std::move(job));
+                        thisPtr->handshakesPending += 1;
+                        thisPtr->queueHostLocked(key, host);
+                        queued = true;
+                    }
+                    else if (host.running == 0 && host.waiting.empty())
+                        thisPtr->handshakeHosts.erase(key);
+                }
+                if (!queued)
+                {
+                    std::cerr << "Too many handshakes waiting, refusing " << newAddress << std::endl;
+                    ss.close(false);
+                    continue;
                 }
                 thisPtr->handshakeCv.notify_one();
             }
@@ -201,14 +305,24 @@ class websocketServer
                 std::unique_lock<std::mutex> lock(thisPtr->handshakeMutex);
                 thisPtr->handshakeCv.wait(lock, [thisPtr]()
                 {
-                    return !thisPtr->handshakeQueue.empty() || !thisPtr->running;
+                    return !thisPtr->readyHosts.empty() || !thisPtr->running;
                 });
-                if (!thisPtr->running && thisPtr->handshakeQueue.empty())
+                if (!thisPtr->running)
                     return;
-                if (thisPtr->handshakeQueue.empty())
+                const std::string key = std::move(thisPtr->readyHosts.front());
+                thisPtr->readyHosts.pop_front();
+                auto found = thisPtr->handshakeHosts.find(key);
+                if (found == thisPtr->handshakeHosts.end())
                     continue;
-                job = std::move(thisPtr->handshakeQueue.front());
-                thisPtr->handshakeQueue.pop();
+                HandshakeHost& host = found->second;
+                host.ready = false;
+                if (host.waiting.empty())
+                    continue;
+                job = std::move(host.waiting.front());
+                host.waiting.pop_front();
+                host.running += 1;
+                // Behind every other host that is waiting, if it has more.
+                thisPtr->queueHostLocked(key, host);
             }
 
             std::cout << "Handshake..." << std::endl;
@@ -222,7 +336,18 @@ class websocketServer
                 c.setSubprotocols(thisPtr->subprotocols);
             }
 
-            if (!c.handshake(thisPtr->useTLS, thisPtr->permitDeflate))
+            const bool shaken = c.handshake(thisPtr->useTLS, thisPtr->permitDeflate);
+            // The slot is given back however the handshake ended. Past this point it is a
+            // connection, which maxConnections bounds.
+            bool hostReady = false;
+            {
+                std::lock_guard<std::mutex> guard(thisPtr->handshakeMutex);
+                hostReady = thisPtr->finishHandshakeLocked(job.host);
+            }
+            if (hostReady)
+                thisPtr->handshakeCv.notify_one();
+
+            if (!shaken)
             {
                 std::cout << "Handshake failed" << std::endl;
                 c.close(thisPtr->useTLS);
@@ -688,6 +813,14 @@ public:
         {
             if (handshakeThreads[i].joinable())
                 handshakeThreads[i].join();
+        }
+
+        // Sockets still waiting for a handshake thread.
+        {
+            std::lock_guard<std::mutex> guard(handshakeMutex);
+            handshakeHosts.clear();
+            readyHosts.clear();
+            handshakesPending = 0;
         }
 
         std::cout << "Closing all remaining connections" << std::endl;

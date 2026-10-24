@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include <thread>
 #include <memory>
 #include <cctype>
 
@@ -33,7 +34,7 @@ static const size_t kMaxPendingSendBytes = 32u * 1024u * 1024u;
 static const uint32_t kMaxHandshakeBytes = 16u * 1024u;
 // Bytes pulled from the socket on one readable event.
 static const uint32_t kReadChunkBytes = 16u * 1024u;
-// How long the handshake thread waits for the rest of the HTTP request.
+// How long one handshake (TLS, the HTTP request, and the reply) may take in all.
 static const int kHandshakeTimeoutMs = 10000;
 // RFC 6455 section 7.1.1: after sending Close, wait for the peer Close.
 static const int kCloseHandshakeTimeoutMs = 5000;
@@ -806,10 +807,26 @@ class websocketConnection
         return true;
     }
 
-    bool sendHttp(const std::string& msg, bool useTLS)
+    // Sends a handshake reply on the non-blocking handshake socket, waiting out a full
+    // send buffer until deadline.
+    bool sendHttp(const std::string& msg, bool useTLS, std::chrono::steady_clock::time_point deadline)
     {
-        int n = sendSome(msg.data(), (int)msg.size(), useTLS);
-        return n >= 0 && (size_t)n == msg.size();
+        size_t sent = 0;
+        while (sent < msg.size())
+        {
+            int n = sendSome(msg.data() + sent, (int)(msg.size() - sent), useTLS);
+            if (n == socket::kWouldBlock)
+            {
+                if (std::chrono::steady_clock::now() >= deadline)
+                    return false;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                continue;
+            }
+            if (n <= 0)
+                return false;
+            sent += (size_t)n;
+        }
+        return true;
     }
 
     void sendHttp400(bool useTLS)
@@ -822,9 +839,8 @@ class websocketConnection
         sendSome(msg, (int)strlen(msg), useTLS);
     }
 
-    bool readHandshake(bool useTLS)
+    bool readHandshake(bool useTLS, std::chrono::steady_clock::time_point deadline)
     {
-        auto start = std::chrono::steady_clock::now();
         while (true)
         {
             std::string soFar(readBuf.begin(), readBuf.end());
@@ -832,11 +848,10 @@ class websocketConnection
             if (end != std::string::npos)
                 return true;
 
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - start).count();
-            if (elapsed >= kHandshakeTimeoutMs)
+            auto now = std::chrono::steady_clock::now();
+            if (now >= deadline)
                 return false;
-            int waitMs = kHandshakeTimeoutMs - (int)elapsed;
+            int waitMs = (int)std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count() + 1;
             int ready = s.waitReadable(waitMs);
             if (ready <= 0)
                 return false;
@@ -1202,14 +1217,20 @@ public:
     bool handshake(bool useTLS, bool allowDeflate = true)
     {
         useTlsFlag = useTLS;
+        // One deadline covers TLS, the HTTP request, and the reply, on a non-blocking socket.
+        // Blocking reads let a peer that sent nothing, or one byte at a time, hold one of the
+        // server's few handshake threads for as long as it liked.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kHandshakeTimeoutMs);
+        if (!s.setNonBlocking(true))
+            return false;
         if (useTLS)
         {
-            if (!tlsSession.handshake(s))
+            if (!tlsSession.handshake(s, deadline))
                 return false;
         }
 
         std::cout << "Receiving websocket http headers..." << std::endl;
-        if (!readHandshake(useTLS))
+        if (!readHandshake(useTLS, deadline))
         {
             std::cerr << "error while receiving websocket handshake" << std::endl;
             sendHttp400(useTLS);
@@ -1291,7 +1312,16 @@ public:
         }
         // RFC 6455 section 4.2.1: Sec-WebSocket-Key decodes to 16 bytes.
         // base64_decode is libwebutil; decodeBase64Url asserts, which would kill the handshake thread.
+        // base64_decode writes every byte its input decodes to (keyLen is only an output), so
+        // the key must be the 24 characters that 16 bytes encode to before keyRaw sees it. A
+        // longer key, up to the 16 KB handshake cap, wrote past keyRaw on the stack.
         std::string normalisedKey = normalizeBase64(trimWs(webSocketKey));
+        if (normalisedKey.size() != 24)
+        {
+            std::cerr << "WS key is not 16 bytes of base64, abort handshake" << std::endl;
+            sendHttp400(useTLS);
+            return false;
+        }
         char keyRaw[24];
         size_t keyLen = sizeof(keyRaw);
         int keyOk = base64_decode(normalisedKey.data(), normalisedKey.size(), keyRaw, &keyLen, 0);
@@ -1414,7 +1444,7 @@ public:
         response += "\r\n";
 
         std::cout << "Sending websocket handshake response..." << std::endl;
-        if (!sendHttp(response, useTLS))
+        if (!sendHttp(response, useTLS, deadline))
         {
             std::cerr << "error while sending websocket handshake response" << std::endl;
             return false;
