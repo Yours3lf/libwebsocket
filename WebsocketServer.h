@@ -525,9 +525,14 @@ class websocketServer
                             else if (ret == -2)
                                 std::cerr << "receiveWebsocketMessage connection closed by us" << std::endl;
                             else if (ret != kCloseQuiet)
-                                std::cerr << "receive error " << ret << std::endl;
+                                std::cerr << "receive error " << ret << ", closing the connection" << std::endl;
 
-                            if (ret == -3 || ret == -2)
+                            // Any other negative code is a socket or TLS failure, such as a peer that
+                            // dropped without a TLS close (SSL_read reports an unexpected EOF as -1).
+                            // That connection is gone like one closed by the other side. Leaving it
+                            // open kept it readable, and this loop spun on it until it expired.
+                            // kCloseQuiet is a close this side started, which the app already knows.
+                            if (ret != kCloseQuiet)
                             {
                                 std::unique_ptr<websocketMessage> closed(new websocketMessage());
                                 closed->buf.clear();
@@ -535,12 +540,9 @@ class websocketServer
                                 thisPtr->pushMessageReceived(std::make_pair(id, std::move(closed)));
                             }
 
-                            if (ret == -3 || ret == -2 || ret == kCloseQuiet)
-                            {
-                                thisPtr->connectionsToBeClosedMutex.lock();
-                                thisPtr->connectionsToBeClosed.push(std::make_pair(id, ret == -2));
-                                thisPtr->connectionsToBeClosedMutex.unlock();
-                            }
+                            thisPtr->connectionsToBeClosedMutex.lock();
+                            thisPtr->connectionsToBeClosed.push(std::make_pair(id, ret == -2));
+                            thisPtr->connectionsToBeClosedMutex.unlock();
                         }
                     }
                 }
