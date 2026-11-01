@@ -129,6 +129,11 @@ public:
         int bytesReceived = 0;
         while (bytesReceived < len)
         {
+            // SSL_get_error reads the thread's error queue first. One thread serves every
+            // connection, and a peer that dropped without a TLS close left its "unexpected
+            // eof" there: the next connection's "want more data" read as that error, and a
+            // healthy upload was closed in the middle.
+            ERR_clear_error();
             int ret = SSL_read(ssl, buf + bytesReceived, len - bytesReceived);
 
             if (ret == 0)
@@ -191,6 +196,7 @@ public:
         int bytesSent = 0;
         while (bytesSent < len)
         {
+            ERR_clear_error();
             int ret = SSL_write(ssl, buf + bytesSent, len - bytesSent);
 
             if (ret == 0)
@@ -267,6 +273,7 @@ public:
 
         for (;;)
         {
+            ERR_clear_error();
             const int ret = SSL_accept(ssl);
             if (ret == 1)
                 break;
@@ -312,6 +319,7 @@ public:
 
         if (clean)
         {
+            ERR_clear_error();
             int ret = SSL_shutdown(ssl);
             // ret 0 means the peer close_notify is still outstanding. The TCP
             // socket is closed by the caller, so the SSL object must not leak.
